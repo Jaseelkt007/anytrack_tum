@@ -545,6 +545,16 @@ def get_dossier(dossier_id: str) -> dict[str, Any]:
                 target_prominence_stars=max_stars,
             )
 
+        # M9.5.5: feedback metadata so the frontend can render a feedback badge
+        # and (when rejected) the timestamp the user marked it.
+        from intelligence.dossier.feedback import count_feedback_for_dossier
+        feedback_count = count_feedback_for_dossier(s, dossier_id)
+        rejected_at: str | None = None
+        if d.get("status") == "rejected":
+            updated = d.get("status_updated_at")
+            if updated is not None:
+                rejected_at = str(updated)
+
         return {
             "id": d.get("id"),
             "target_person_id": d.get("target_person_id"),
@@ -565,6 +575,8 @@ def get_dossier(dossier_id: str) -> dict[str, Any]:
             "triggering_event_ids": rec["triggering_event_ids"] or [],
             "score_components": score_components,
             "score_explanation": score_explanation,
+            "feedback_count": feedback_count,
+            "rejected_at": rejected_at,
         }
 
 
@@ -639,6 +651,70 @@ def regenerate_dossier(body: dict[str, Any] = Body(default_factory=dict)) -> dic
         "results": results,
         "generatedAt": _now_iso(),
     }
+
+
+# --- M9.5.5 Dossier feedback endpoints ------------------------------------
+
+@app.post("/api/dossier/{dossier_id}/feedback")
+def submit_dossier_feedback(
+    dossier_id: str,
+    body: dict[str, Any] = Body(...),
+) -> dict[str, Any]:
+    """Persist a feedback event for one dossier.
+
+    Body:
+      verdict                  : 'correct' | 'wrong_classification' | 'wrong_target' | 'spam' | 'low_priority'
+      corrected_classification : (required when verdict='wrong_classification') one of the 5 classification roles
+      notes                    : (optional) short free-text reviewer note
+
+    Returns 200 with the FeedbackResult shape on success. Negative verdicts
+    auto-flip the underlying dossier to status='rejected' (unless it's already
+    'sent', in which case status is preserved per the M9.5 immutability rule).
+    """
+    from intelligence.dossier.feedback import (
+        DossierNotFoundError,
+        FeedbackValidationError,
+        submit_feedback,
+    )
+    verdict = body.get("verdict")
+    corrected = body.get("corrected_classification")
+    notes = body.get("notes")
+    try:
+        with _session() as s:
+            res = submit_feedback(
+                s, user_id=DEMO_USER_ID, dossier_id=dossier_id,
+                verdict=verdict, corrected_classification=corrected, notes=notes,
+            )
+    except FeedbackValidationError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except DossierNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+    return {
+        "id":                  res.feedback_id,
+        "dossier_id":          res.dossier_id,
+        "verdict":             res.verdict,
+        "submitted_at":        res.submitted_at,
+        "side_effect":         res.side_effect,
+        "new_dossier_status":  res.new_dossier_status,
+    }
+
+
+@app.get("/api/dossier/{dossier_id}/feedback")
+def list_dossier_feedback(dossier_id: str) -> list[dict[str, Any]]:
+    """Chronological list of all feedback events for one dossier."""
+    from intelligence.dossier.feedback import list_feedback_for_dossier
+    with _session() as s:
+        return list_feedback_for_dossier(s, dossier_id)
+
+
+@app.get("/api/feedback")
+def list_all_feedback(since: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    """All feedback events for the demo user, optionally since an ISO datetime.
+    Used by an admin/audit view and as the labelling source for M11."""
+    from intelligence.dossier.feedback import list_feedback_for_user
+    with _session() as s:
+        return list_feedback_for_user(s, DEMO_USER_ID, since=since, limit=limit)
 
 
 # Also expose /api/explore as an alias if the frontend looks for it.

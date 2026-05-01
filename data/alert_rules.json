@@ -7,9 +7,11 @@
     "role_tag_filter": [],
     "signal_types": [
       "FOLLOWS_ON_GITHUB",
-      "STARRED_REPO"
+      "STARRED_REPO",
+      "FOLLOWS_ON_TWITTER"
     ],
     "sort_by": "score",
+    "twitter_signal_min_confidence": 0.0,
     "weight_distinct_members": 1.0,
     "weight_member_quality": 0.0,
     "weight_recency": 1.0,

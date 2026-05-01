@@ -1,0 +1,221 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080" role="img" aria-labelledby="title desc">
+  <title id="title">X Twitter signal pipeline for social sourcing</title>
+  <desc id="desc">A 16:9 diagram showing how X watchlists are snapshotted through ScrapeBadger, diffed into follow signals, loaded into Neo4j, merged with GitHub convergence, classified, and presented as founder dossiers.</desc>
+  <defs>
+    <radialGradient id="bgRadial" cx="50%" cy="10%" r="92%">
+      <stop offset="0" stop-color="#15283f"/>
+      <stop offset="0.48" stop-color="#0b1323"/>
+      <stop offset="1" stop-color="#05070d"/>
+    </radialGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#67e8f9"/>
+      <stop offset="1" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="purple" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#d8b4fe"/>
+      <stop offset="1" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="orange" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fed7aa"/>
+      <stop offset="1" stop-color="#fb923c"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#bbf7d0"/>
+      <stop offset="1" stop-color="#22c55e"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="18" stdDeviation="20" flood-color="#000000" flood-opacity="0.42"/>
+    </filter>
+    <filter id="glow" x="-45%" y="-45%" width="190%" height="190%">
+      <feGaussianBlur stdDeviation="7" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <pattern id="dots" width="34" height="34" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1.4" fill="#ffffff" opacity="0.08"/>
+    </pattern>
+    <marker id="arrow" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 13 7 L 1 13 Z" fill="#8be9ff"/>
+    </marker>
+    <marker id="arrowHot" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto" markerUnits="strokeWidth">
+      <path d="M 1 1 L 13 7 L 1 13 Z" fill="#fb923c"/>
+    </marker>
+    <style>
+      .title { font-family: "Aptos Display", "IBM Plex Sans", "Segoe UI", sans-serif; font-size: 58px; font-weight: 800; letter-spacing: -1.6px; fill: #f8fbff; }
+      .subtitle { font-family: "IBM Plex Sans", "Segoe UI", sans-serif; font-size: 24px; fill: #b8c9df; }
+      .eyebrow { font-family: "IBM Plex Mono", "SFMono-Regular", monospace; font-size: 17px; font-weight: 700; letter-spacing: 2px; text-transform: uppercase; fill: #a78bfa; }
+      .section { font-family: "IBM Plex Mono", "SFMono-Regular", monospace; font-size: 15px; font-weight: 700; letter-spacing: 1.4px; fill: #c4b5fd; }
+      .card-title { font-family: "Aptos Display", "IBM Plex Sans", "Segoe UI", sans-serif; font-size: 27px; font-weight: 800; fill: #ffffff; }
+      .card-text { font-family: "IBM Plex Sans", "Segoe UI", sans-serif; font-size: 18px; fill: #dbe8f6; }
+      .small { font-family: "IBM Plex Sans", "Segoe UI", sans-serif; font-size: 15px; fill: #aabbd1; }
+      .mono { font-family: "IBM Plex Mono", "SFMono-Regular", monospace; font-size: 15px; fill: #e7fbff; }
+      .pill { font-family: "IBM Plex Mono", "SFMono-Regular", monospace; font-size: 14px; font-weight: 700; fill: #07111f; }
+      .box { fill: rgba(13, 22, 38, 0.9); stroke: rgba(205, 220, 255, 0.24); stroke-width: 1.4; filter: url(#shadow); }
+      .file { fill: rgba(42, 50, 67, 0.96); stroke: rgba(205, 220, 255, 0.22); stroke-width: 1.2; }
+      .arrow { fill: none; stroke: #8be9ff; stroke-width: 4; stroke-linecap: round; marker-end: url(#arrow); }
+      .arrow-soft { fill: none; stroke: #8be9ff; stroke-width: 3; stroke-linecap: round; stroke-dasharray: 8 11; opacity: 0.7; marker-end: url(#arrow); }
+      .arrow-hot { fill: none; stroke: #fb923c; stroke-width: 5; stroke-linecap: round; marker-end: url(#arrowHot); filter: url(#glow); }
+      .hairline { stroke: rgba(255,255,255,0.14); stroke-width: 1; }
+    </style>
+  </defs>
+
+  <rect width="1920" height="1080" fill="url(#bgRadial)"/>
+  <rect width="1920" height="1080" fill="url(#dots)"/>
+  <path d="M 1110 -120 C 1560 40 1800 270 1915 660 L 1915 -120 Z" fill="#4c1d95" opacity="0.16"/>
+  <path d="M -80 870 C 240 670 470 766 760 1040 L -80 1160 Z" fill="#0e7490" opacity="0.13"/>
+
+  <text x="72" y="74" class="eyebrow">Social Sourcing for VCs</text>
+  <text x="72" y="138" class="title">X / Twitter Pipeline</text>
+  <text x="72" y="176" class="subtitle">Snapshot diffs turn newly observed VC follows into cross-platform founder convergence.</text>
+
+  <g transform="translate(1410 62)">
+    <rect x="0" y="0" width="430" height="98" rx="24" fill="#100f1f" stroke="#6d5ca8" stroke-width="1.2"/>
+    <text x="24" y="38" class="card-title">Important constraint</text>
+    <text x="24" y="72" class="card-text">X has no real follow timestamps; first_seen_at is snapshot time.</text>
+  </g>
+
+  <g transform="translate(60 244)">
+    <rect class="box" width="288" height="258" rx="30"/>
+    <rect x="22" y="22" width="58" height="34" rx="17" fill="url(#cyan)"/>
+    <text x="37" y="45" class="pill">01</text>
+    <text x="22" y="88" class="card-title">Watchlist build</text>
+    <text x="22" y="128" class="card-text">Neo4j selects investors</text>
+    <text x="22" y="154" class="card-text">with Twitter identities.</text>
+    <rect x="22" y="182" width="244" height="46" rx="14" class="file"/>
+    <text x="38" y="211" class="mono">twitter_vc_watchlist.txt</text>
+    <text x="22" y="246" class="small">Optional target filter narrows demo noise.</text>
+  </g>
+
+  <g transform="translate(410 244)">
+    <rect class="box" width="288" height="258" rx="30"/>
+    <rect x="22" y="22" width="58" height="34" rx="17" fill="url(#purple)"/>
+    <text x="37" y="45" class="pill">02</text>
+    <text x="22" y="88" class="card-title">ScrapeBadger</text>
+    <text x="22" y="128" class="card-text">HTTP client polls each</text>
+    <text x="22" y="154" class="card-text">watcher's following page.</text>
+    <text x="22" y="194" class="mono">lookup_user</text>
+    <text x="22" y="220" class="mono">list_followings</text>
+    <text x="22" y="246" class="mono">latest_tweets</text>
+  </g>
+
+  <g transform="translate(760 244)">
+    <rect class="box" width="288" height="258" rx="30"/>
+    <rect x="22" y="22" width="58" height="34" rx="17" fill="#dbeafe"/>
+    <text x="37" y="45" class="pill">03</text>
+    <text x="22" y="88" class="card-title">Snapshot store</text>
+    <text x="22" y="128" class="card-text">Fresh following list is</text>
+    <text x="22" y="154" class="card-text">written per handle.</text>
+    <rect x="22" y="182" width="244" height="46" rx="14" class="file"/>
+    <text x="38" y="211" class="mono">snapshots/{handle}.json</text>
+    <text x="22" y="246" class="small">Raw API blobs are archived first.</text>
+  </g>
+
+  <g transform="translate(1110 244)">
+    <rect class="box" width="288" height="258" rx="30"/>
+    <rect x="22" y="22" width="58" height="34" rx="17" fill="url(#orange)"/>
+    <text x="37" y="45" class="pill">04</text>
+    <text x="22" y="88" class="card-title">Diff engine</text>
+    <text x="22" y="128" class="card-text">prior snapshot vs fresh</text>
+    <text x="22" y="154" class="card-text">snapshot creates signals.</text>
+    <rect x="22" y="182" width="244" height="46" rx="14" fill="#2a1a0b" stroke="#fb923c"/>
+    <text x="38" y="211" class="mono">newly observed follow</text>
+    <text x="22" y="246" class="small">confidence 0.91 for true diffs.</text>
+  </g>
+
+  <g transform="translate(1460 244)">
+    <rect class="box" width="330" height="258" rx="30"/>
+    <rect x="22" y="22" width="58" height="34" rx="17" fill="url(#green)"/>
+    <text x="37" y="45" class="pill">05</text>
+    <text x="22" y="88" class="card-title">Load to graph</text>
+    <text x="22" y="128" class="card-text">JSONL signals pass through</text>
+    <text x="22" y="154" class="card-text">identity resolution.</text>
+    <text x="22" y="194" class="mono">FOLLOWS_ON_TWITTER</text>
+    <text x="22" y="220" class="mono">first_seen_at = captured_at</text>
+    <text x="22" y="246" class="small">Idempotent on watcher + target.</text>
+  </g>
+
+  <path class="arrow" d="M 348 373 C 370 373 386 373 410 373"/>
+  <path class="arrow" d="M 698 373 C 720 373 736 373 760 373"/>
+  <path class="arrow" d="M 1048 373 C 1070 373 1086 373 1110 373"/>
+  <path class="arrow" d="M 1398 373 C 1420 373 1436 373 1460 373"/>
+
+  <g transform="translate(224 586)">
+    <text x="0" y="0" class="section">ARTIFACTS CREATED BEFORE GRAPH LOAD</text>
+    <line x1="0" y1="24" x2="1452" y2="24" class="hairline"/>
+  </g>
+
+  <g transform="translate(236 642)">
+    <rect class="file" width="314" height="86" rx="22"/>
+    <text x="24" y="36" class="card-text">RawArtifactStore</text>
+    <text x="24" y="64" class="mono">raw_artifacts/scrapebadger/</text>
+  </g>
+  <g transform="translate(606 642)">
+    <rect class="file" width="314" height="86" rx="22"/>
+    <text x="24" y="36" class="card-text">Append-only signal log</text>
+    <text x="24" y="64" class="mono">follow_signals.jsonl</text>
+  </g>
+  <g transform="translate(976 642)">
+    <rect class="file" width="314" height="86" rx="22"/>
+    <text x="24" y="36" class="card-text">Identity Resolver</text>
+    <text x="24" y="64" class="mono">override -> bio -> LLM -> fresh</text>
+  </g>
+  <g transform="translate(1346 642)">
+    <rect class="file" width="314" height="86" rx="22"/>
+    <text x="24" y="36" class="card-text">Neo4j edge</text>
+    <text x="24" y="64" class="mono">Person -> Person follow</text>
+  </g>
+
+  <path class="arrow-soft" d="M 554 685 C 575 685 585 685 606 685"/>
+  <path class="arrow-soft" d="M 920 685 C 947 685 955 685 976 685"/>
+  <path class="arrow-soft" d="M 1290 685 C 1317 685 1325 685 1346 685"/>
+
+  <g transform="translate(294 846)">
+    <rect class="box" width="322" height="150" rx="28"/>
+    <text x="26" y="48" class="card-title">Unified convergence</text>
+    <text x="26" y="82" class="card-text">GH follows + repo stars</text>
+    <text x="26" y="110" class="card-text">+ X follows are unioned.</text>
+    <text x="26" y="134" class="mono">&gt;=2 distinct watchers</text>
+  </g>
+
+  <g transform="translate(714 846)">
+    <rect class="box" width="322" height="150" rx="28"/>
+    <text x="26" y="48" class="card-title">Enrich target</text>
+    <text x="26" y="82" class="card-text">ScrapeBadger profile,</text>
+    <text x="26" y="110" class="card-text">latest tweets, bio links.</text>
+    <text x="26" y="134" class="mono">EnrichmentBundle</text>
+  </g>
+
+  <g transform="translate(1134 846)">
+    <rect class="box" width="322" height="150" rx="28"/>
+    <text x="26" y="48" class="card-title">Classify dossier</text>
+    <text x="26" y="82" class="card-text">Gemini 2.5 Flash</text>
+    <text x="26" y="110" class="card-text">grounds claims in evidence.</text>
+    <text x="26" y="134" class="mono">ready_to_send if conf &gt;= 0.85</text>
+  </g>
+
+  <g transform="translate(1554 846)">
+    <rect class="box" width="270" height="150" rx="28"/>
+    <text x="26" y="48" class="card-title">Product loop</text>
+    <text x="26" y="82" class="card-text">API, frontend,</text>
+    <text x="26" y="110" class="card-text">user verdict.</text>
+    <text x="26" y="134" class="mono">DossierFeedback</text>
+  </g>
+
+  <path class="arrow-hot" d="M 1625 502 C 1625 610 514 716 455 846"/>
+  <path class="arrow" d="M 616 921 C 654 921 676 921 714 921"/>
+  <path class="arrow" d="M 1036 921 C 1074 921 1096 921 1134 921"/>
+  <path class="arrow" d="M 1456 921 C 1494 921 1516 921 1554 921"/>
+
+  <g transform="translate(72 1008)">
+    <circle cx="10" cy="-6" r="7" fill="#67e8f9"/>
+    <text x="28" y="0" class="small">VC watchlist</text>
+    <circle cx="208" cy="-6" r="7" fill="#7c3aed"/>
+    <text x="226" y="0" class="small">ScrapeBadger external API</text>
+    <circle cx="504" cy="-6" r="7" fill="#fb923c"/>
+    <text x="522" y="0" class="small">Snapshot diff / timing approximation</text>
+    <circle cx="878" cy="-6" r="7" fill="#22c55e"/>
+    <text x="896" y="0" class="small">Dossier workflow</text>
+  </g>
+</svg>

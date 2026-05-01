@@ -53,3 +53,4 @@ data/dumps/
 
 # --- Cleaned investor CSV is regeneratable from the source CSV; don't commit ---
 data/investors_clean.csv
+data/
