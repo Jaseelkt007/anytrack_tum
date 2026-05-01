@@ -57,12 +57,16 @@ SET
 
 UPSERT_GITHUB_IDENTITY = """
 MATCH (p:Person {canonical_id: $canonical_id})
-MERGE (i:PlatformIdentity {platform: 'github', handle: $github_handle})
+WITH p, toLower($github_handle) AS handle_lc
+MERGE (i:PlatformIdentity {platform: 'github', handle: handle_lc})
 ON CREATE SET
+    i.handle_original   = $github_handle,
     i.profile_url       = $profile_url,
     i.verified_via      = 'manual',
     i.confidence        = 1.0,
+    i.kind              = 'User',
     i.first_observed_at = datetime($now_iso)
+SET i.kind = coalesce(i.kind, 'User')
 MERGE (p)-[:HAS_IDENTITY]->(i)
 """
 

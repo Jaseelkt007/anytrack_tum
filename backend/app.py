@@ -68,7 +68,20 @@ async def lifespan(app: FastAPI):
     if not all([uri, user, pw]):
         raise RuntimeError("NEO4J_URI / NEO4J_USER / NEO4J_PASSWORD must be set in .env")
     Neo4jState.driver = GraphDatabase.driver(uri, auth=(user, pw))
+
+    # M12: pipeline scheduler. Idempotent — disabled cleanly when apscheduler
+    # is unavailable or PIPELINE_SCHEDULER_DISABLED=1.
+    if os.environ.get("PIPELINE_SCHEDULER_DISABLED", "").lower() not in ("1", "true", "yes"):
+        from backend import scheduler as _sched
+        _sched.start_scheduler()
+
     yield
+
+    try:
+        from backend import scheduler as _sched
+        _sched.stop_scheduler()
+    except Exception:
+        pass
     if Neo4jState.driver is not None:
         Neo4jState.driver.close()
 
@@ -114,14 +127,73 @@ def health() -> dict[str, Any]:
             neo4j_ok = r is not None and r.get("ok") == 1
     except (ServiceUnavailable, Exception):  # pragma: no cover
         neo4j_ok = False
-    return {"ok": neo4j_ok, "neo4j": neo4j_ok, "generatedAt": _now_iso()}
+
+    pipeline_block: dict[str, Any] = {}
+    try:
+        from backend import scheduler as _sched
+        info = _sched.get_last_run()
+        pipeline_block = {
+            "currently_running": info.get("currently_running", False),
+            "last_started_at":   info.get("last_started_at"),
+            "last_finished_at":  info.get("last_finished_at"),
+            "last_status":       info.get("last_status"),
+            "stages":            {k: v.get("status")
+                                  for k, v in (info.get("stages") or {}).items()},
+        }
+    except Exception:
+        pipeline_block = {"available": False}
+
+    return {
+        "ok": neo4j_ok,
+        "neo4j": neo4j_ok,
+        "pipeline": pipeline_block,
+        "generatedAt": _now_iso(),
+    }
+
+
+@app.post("/api/pipeline/run")
+def pipeline_run_now(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    """Trigger an immediate pipeline run in the background.
+
+    Body (all optional):
+      skip_twitter: bool — when true, skips the slow Twitter ingest stage.
+
+    Returns 202-style payload immediately. Poll /api/health for completion.
+    """
+    from backend import scheduler as _sched
+    skip_twitter = bool(body.get("skip_twitter", False))
+    res = _sched.trigger_pipeline_now(skip_twitter=skip_twitter)
+    if not res.get("started"):
+        # Already running — return 409 to be RESTful about it.
+        raise HTTPException(status_code=409, detail=res)
+    return res
+
+
+@app.get("/api/pipeline/status")
+def pipeline_status() -> dict[str, Any]:
+    """Full status of the most recent pipeline run, including per-stage error messages."""
+    from backend import scheduler as _sched
+    return _sched.get_last_run()
+
+
+def _dedupe_by_id(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Defense-in-depth: drop rows that share an id. Order-preserving."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for item in items:
+        key = item.get("id")
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(item)
+    return out
 
 
 @app.get("/api/investors")
 def list_investors() -> list[dict[str, Any]]:
     with _session() as s:
         rows = list(s.run(queries.LIST_INVESTORS, user_id=DEMO_USER_ID))
-    return [map_investor(dict(r)) for r in rows]
+    return _dedupe_by_id([map_investor(dict(r)) for r in rows])
 
 
 @app.get("/api/founders")
@@ -133,7 +205,7 @@ def list_founders() -> list[dict[str, Any]]:
             min_watchers=MIN_WATCHERS,
             limit=FOUNDER_LIMIT,
         ))
-    return [map_founder(dict(r)) for r in rows]
+    return _dedupe_by_id([map_founder(dict(r)) for r in rows])
 
 
 @app.get("/api/alerts")
@@ -319,7 +391,8 @@ def person_detail(person_id: str) -> dict[str, Any]:
 
 @app.get("/api/founder/{founder_id}")
 def founder_detail(founder_id: str) -> dict[str, Any]:
-    """Founder + the convergence alerts that fired for them."""
+    """Founder + the convergence alerts that fired for them.
+    Additive (M9.5): includes latest_dossier_id when a Dossier exists."""
     with _session() as s:
         head = s.run(queries.PERSON_DETAIL, id=founder_id, user_id=DEMO_USER_ID).single()
         if head is None:
@@ -341,9 +414,231 @@ def founder_detail(founder_id: str) -> dict[str, Any]:
             min_watchers=MIN_WATCHERS,
             limit=200,
         ))
+        latest_dossier = s.run(
+            _LATEST_DOSSIER_FOR_TARGET,
+            user_id=DEMO_USER_ID, target_id=founder_id,
+        ).single()
 
     alerts = [map_alert(dict(r)) for r in alert_rows if r["founder_id"] == founder_id]
-    return {**founder, "alerts": alerts}
+    out: dict[str, Any] = {**founder, "alerts": alerts}
+    if latest_dossier:
+        out["latest_dossier_id"] = latest_dossier["id"]
+        out["latest_dossier_classification"] = latest_dossier["classification"]
+        out["latest_dossier_status"] = latest_dossier["status"]
+    return out
+
+
+# --- M9.5 Dossier endpoints ------------------------------------------------
+
+_LATEST_DOSSIER_FOR_TARGET = """
+MATCH (d:Dossier {user_id: $user_id, target_person_id: $target_id})
+RETURN d.id AS id,
+       d.classification AS classification,
+       d.status AS status,
+       toString(d.generated_at) AS generated_at
+ORDER BY d.generated_at DESC
+LIMIT 1
+"""
+
+_LIST_DOSSIERS = """
+MATCH (d:Dossier {user_id: $user_id})
+WHERE $status IS NULL OR d.status = $status
+OPTIONAL MATCH (d)-[:DOSSIER_FOR]->(p:Person)
+RETURN d.id                  AS id,
+       d.target_person_id    AS target_person_id,
+       coalesce(p.display_name, '') AS target_name,
+       d.classification      AS classification,
+       d.confidence           AS confidence,
+       d.status               AS status,
+       coalesce(d.recommended_action, '') AS recommended_action,
+       toString(d.generated_at) AS generated_at,
+       coalesce(d.kb_cross_match_kind, 'unknown') AS kb_cross_match_kind
+ORDER BY d.generated_at DESC
+LIMIT $limit
+"""
+
+_GET_DOSSIER = """
+MATCH (d:Dossier {id: $id})
+OPTIONAL MATCH (d)-[:DOSSIER_FOR]->(p:Person)
+OPTIONAL MATCH (d)-[:BUILT_FROM]->(c:ConvergenceEvent)
+RETURN d, coalesce(p.display_name, '') AS target_name,
+       collect(c.id) AS triggering_event_ids
+"""
+
+
+@app.get("/api/dossiers")
+def list_dossiers(status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    """Summary list. Pass ?status=draft|ready_to_send|sent|rejected|failed to filter."""
+    with _session() as s:
+        rows = list(s.run(_LIST_DOSSIERS,
+                          user_id=DEMO_USER_ID,
+                          status=status,
+                          limit=limit))
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/dossier/{dossier_id}")
+def get_dossier(dossier_id: str) -> dict[str, Any]:
+    """Full dossier with parsed evidence_bundle and key_signals."""
+    import json as _json
+    with _session() as s:
+        rec = s.run(_GET_DOSSIER, id=dossier_id).single()
+        if rec is None:
+            raise HTTPException(status_code=404, detail="Dossier not found")
+        d = dict(rec["d"])
+        evidence_bundle: Any = None
+        if d.get("evidence_bundle_json"):
+            try:
+                evidence_bundle = _json.loads(d["evidence_bundle_json"])
+            except _json.JSONDecodeError:
+                evidence_bundle = None
+        key_signals: list = []
+        if d.get("key_signals_json"):
+            try:
+                key_signals = _json.loads(d["key_signals_json"])
+            except _json.JSONDecodeError:
+                key_signals = []
+        cross_check_kb: dict = {}
+        if d.get("cross_check_kb_json"):
+            try:
+                cross_check_kb = _json.loads(d["cross_check_kb_json"])
+            except _json.JSONDecodeError:
+                cross_check_kb = {}
+        # Derive score explanation from the bundle's convergence evidence.
+        score_explanation: list[dict[str, Any]] = []
+        score_components: dict[str, float] = {}
+        if isinstance(evidence_bundle, dict):
+            ce = evidence_bundle.get("convergence_evidence") or {}
+            owned = evidence_bundle.get("owned_repos") or []
+            max_stars = max((int(r.get("stars") or 0) for r in owned), default=0)
+            distinct = int(ce.get("distinct_member_count") or 0)
+            # The bundle stores the total score but not the per-component
+            # breakdown — recompute it from the rule + edges. Cheap enough.
+            from intelligence.convergence import compute_score, compute_target_prominence
+            from intelligence.rule import get_rule
+            rule = get_rule(DEMO_USER_ID)
+            prom = compute_target_prominence(
+                max_stars,
+                min_stars=rule.prominence_min_stars,
+                max_cap=rule.prominence_max_stars_cap,
+            )
+            evidence_rows = ce.get("evidence_rows") or []
+            newest_iso = max(
+                (r.get("edge_at") for r in evidence_rows if r.get("edge_at")),
+                default=None,
+            )
+            _, breakdown = compute_score(
+                distinct, newest_iso,
+                ce.get("window_end") or _now_iso(),
+                rule.window_days,
+                weight_distinct_members=rule.weight_distinct_members,
+                weight_recency=rule.weight_recency,
+                weight_member_quality=rule.weight_member_quality,
+                weight_target_prominence=rule.weight_target_prominence,
+                target_prominence_value=prom,
+            )
+            score_components = breakdown
+            from backend.mappers import explain_score
+            score_explanation = explain_score(
+                breakdown,
+                distinct_member_count=distinct,
+                target_prominence_stars=max_stars,
+            )
+
+        return {
+            "id": d.get("id"),
+            "target_person_id": d.get("target_person_id"),
+            "target_name": rec["target_name"],
+            "user_id": d.get("user_id"),
+            "classification": d.get("classification"),
+            "confidence": d.get("confidence"),
+            "narrative": d.get("narrative"),
+            "key_signals": key_signals,
+            "recommended_action": d.get("recommended_action"),
+            "cross_check_kb": cross_check_kb,
+            "kb_cross_match_kind": d.get("kb_cross_match_kind"),
+            "status": d.get("status"),
+            "evidence_bundle": evidence_bundle,
+            "evidence_bundle_hash": d.get("evidence_bundle_hash"),
+            "generated_at": str(d.get("generated_at")),
+            "llm_model": d.get("llm_model"),
+            "triggering_event_ids": rec["triggering_event_ids"] or [],
+            "score_components": score_components,
+            "score_explanation": score_explanation,
+        }
+
+
+@app.post("/api/dossiers/regenerate")
+def regenerate_dossier(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    """Trigger dossier (re)generation for one target or for all eligible events.
+
+    Body:
+      target_id          : str, optional. If given, only that target is processed.
+      force_reclassify   : bool, default False. Bypasses bundle-hash idempotency.
+      score_threshold    : float, default 0.0. Skip events below this score (when target_id is omitted).
+    """
+    target_id = body.get("target_id")
+    force = bool(body.get("force_reclassify", False))
+    score_threshold = float(body.get("score_threshold", 0.0))
+
+    from intelligence.dossier.classifier import GeminiClassifier
+    from intelligence.dossier.dossier import build_or_update
+    from intelligence.dossier.enrichment import enrich, TargetNotFoundError
+    from scrapers.github_client import GitHubClient
+
+    gh_token = os.environ.get("GITHUB_TOKEN")
+    github_client = GitHubClient(tokens=[gh_token]) if gh_token else None
+    try:
+        llm = GeminiClassifier()
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=f"Gemini unavailable: {e}")
+
+    results: list[dict[str, Any]] = []
+    with _session() as s:
+        if target_id:
+            ev = s.run("""
+                MATCH (c:ConvergenceEvent {user_id: $u})-[:ABOUT]->(p:Person {canonical_id: $tid})
+                RETURN collect(c.id) AS ids
+            """, u=DEMO_USER_ID, tid=target_id).single()
+            targets = [(target_id, (ev["ids"] if ev else []) or [])]
+        else:
+            rows = s.run("""
+                MATCH (c:ConvergenceEvent {user_id: $u})-[:ABOUT]->(p:Person)
+                WHERE c.score >= $st
+                RETURN p.canonical_id AS tid, collect(c.id) AS ids
+            """, u=DEMO_USER_ID, st=score_threshold).data()
+            targets = [(r["tid"], r["ids"] or []) for r in rows]
+
+        for tid, ev_ids in targets:
+            try:
+                bundle = enrich(s, tid, user_id=DEMO_USER_ID, github_client=github_client)
+                res = build_or_update(
+                    s, user_id=DEMO_USER_ID, bundle=bundle,
+                    triggering_event_ids=ev_ids,
+                    llm=llm, force_reclassify=force,
+                )
+                results.append({
+                    "target_id": tid,
+                    "dossier_id": res.dossier_id,
+                    "classification": res.classification,
+                    "confidence": res.confidence,
+                    "status": res.status,
+                    "regenerated": res.regenerated,
+                    "cached": res.cached,
+                    "grounding_issues": res.grounding_issues,
+                })
+            except TargetNotFoundError:
+                results.append({"target_id": tid, "error": "not_found"})
+            except Exception as e:
+                results.append({"target_id": tid,
+                                "error": f"{type(e).__name__}: {e}"})
+
+    return {
+        "user_id": DEMO_USER_ID,
+        "processed": len(results),
+        "results": results,
+        "generatedAt": _now_iso(),
+    }
 
 
 # Also expose /api/explore as an alias if the frontend looks for it.

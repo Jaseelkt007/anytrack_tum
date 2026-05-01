@@ -15,18 +15,23 @@ HEALTH = "RETURN 1 AS ok"
 
 LIST_INVESTORS = """
 MATCH (p:Person)-[w:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
-OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(li:PlatformIdentity {platform: 'linkedin'})
-OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(tw:PlatformIdentity {platform: 'twitter'})
-OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
+CALL {
+  WITH p
+  OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(i:PlatformIdentity)
+  RETURN
+    head(collect(DISTINCT CASE WHEN i.platform='linkedin' THEN i.profile_url END)) AS linkedin_url,
+    head(collect(DISTINCT CASE WHEN i.platform='twitter'  THEN i.handle      END)) AS twitter_handle,
+    head(collect(DISTINCT CASE WHEN i.platform='github'   THEN i.handle      END)) AS github_handle
+}
 RETURN
   p.canonical_id   AS id,
   p.display_name   AS name,
   p.investor_type  AS investor_type,
   w.archetype      AS archetype,
   p.country        AS country,
-  li.profile_url   AS linkedin_url,
-  tw.handle        AS twitter_handle,
-  gh.handle        AS github_handle
+  linkedin_url,
+  twitter_handle,
+  github_handle
 ORDER BY p.display_name
 """
 
@@ -38,21 +43,30 @@ ORDER BY p.display_name
 
 LIST_FOUNDER_CANDIDATES = """
 // Read from persisted ConvergenceEvent nodes (populated by intelligence.convergence).
-// Falls back to live query if no events are persisted yet.
+// Excludes targets that have since become active watchers (defense-in-depth: the
+// stale-event purge in intelligence/convergence.py also removes those).
 MATCH (c:ConvergenceEvent {user_id: $user_id})-[:ABOUT]->(target:Person)
 WHERE c.distinct_member_count >= $min_watchers
-OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
-OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(li:PlatformIdentity {platform: 'linkedin'})
-OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(tw:PlatformIdentity {platform: 'twitter'})
+  AND NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+  AND coalesce(target.entity_type, 'User') = 'User'
+CALL {
+  WITH target
+  OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(i:PlatformIdentity)
+  RETURN
+    head(collect(DISTINCT CASE WHEN i.platform='github'   THEN i.handle      END)) AS github_handle,
+    head(collect(DISTINCT CASE WHEN i.platform='github'   THEN i.profile_url END)) AS github_url,
+    head(collect(DISTINCT CASE WHEN i.platform='linkedin' THEN i.profile_url END)) AS linkedin_url,
+    head(collect(DISTINCT CASE WHEN i.platform='twitter'  THEN i.handle      END)) AS twitter_handle
+}
 RETURN
   target.canonical_id        AS id,
   target.display_name        AS name,
   c.distinct_member_count    AS watcher_count,
   c.score                    AS score,
-  gh.handle                  AS github_handle,
-  gh.profile_url             AS github_url,
-  li.profile_url             AS linkedin_url,
-  tw.handle                  AS twitter_handle
+  github_handle,
+  github_url,
+  linkedin_url,
+  twitter_handle
 ORDER BY c.score DESC, watcher_count DESC, target.display_name
 LIMIT $limit
 """
@@ -66,12 +80,20 @@ LIST_CONVERGENCE_SIGNALS = """
 // Read from persisted ConvergenceEvent nodes; signals come from evidence_json.
 MATCH (c:ConvergenceEvent {user_id: $user_id})-[:ABOUT]->(target:Person)
 WHERE c.distinct_member_count >= $min_watchers
-OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
+  AND NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+  AND coalesce(target.entity_type, 'User') = 'User'
+CALL {
+  WITH target
+  OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(i:PlatformIdentity {platform: 'github'})
+  RETURN
+    head(collect(DISTINCT i.handle))      AS github_handle,
+    head(collect(DISTINCT i.profile_url)) AS github_url
+}
 RETURN
   target.canonical_id        AS founder_id,
   target.display_name        AS founder_name,
-  gh.handle                  AS github_handle,
-  gh.profile_url             AS github_url,
+  github_handle,
+  github_url,
   c.evidence_json            AS evidence_json,
   c.distinct_member_count    AS distinct_watchers,
   c.score                    AS score,
@@ -92,9 +114,15 @@ LIMIT $limit
 PERSON_DETAIL = """
 MATCH (p:Person {canonical_id: $id})
 OPTIONAL MATCH (p)-[w:WATCHED_BY]->(:User {id: $user_id})
-OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(li:PlatformIdentity {platform: 'linkedin'})
-OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(tw:PlatformIdentity {platform: 'twitter'})
-OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
+CALL {
+  WITH p
+  OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(i:PlatformIdentity)
+  RETURN
+    head(collect(DISTINCT CASE WHEN i.platform='linkedin' THEN i.profile_url END)) AS linkedin_url,
+    head(collect(DISTINCT CASE WHEN i.platform='twitter'  THEN i.handle      END)) AS twitter_handle,
+    head(collect(DISTINCT CASE WHEN i.platform='github'   THEN i.handle      END)) AS github_handle,
+    head(collect(DISTINCT CASE WHEN i.platform='github'   THEN i.profile_url END)) AS github_url
+}
 RETURN
   p.canonical_id   AS id,
   p.display_name   AS name,
@@ -103,10 +131,10 @@ RETURN
   p.country        AS country,
   w.tier           AS watch_tier,
   w.archetype      AS archetype,
-  li.profile_url   AS linkedin_url,
-  tw.handle        AS twitter_handle,
-  gh.handle        AS github_handle,
-  gh.profile_url   AS github_url
+  linkedin_url,
+  twitter_handle,
+  github_handle,
+  github_url
 """
 
 
@@ -115,19 +143,25 @@ RETURN
 PERSON_OUTBOUND_SIGNALS = """
 MATCH (p:Person {canonical_id: $id})
 OPTIONAL MATCH (p)-[s:STARRED_REPO]->(r:Repository)
-WITH p, collect({
+WITH p, collect(DISTINCT {
   type: 'STARRED_REPO',
   repo_full_name: r.full_name,
   repo_html_url: r.html_url,
   first_seen_at: s.first_seen_at
 })[0..15] AS stars
 OPTIONAL MATCH (p)-[f:FOLLOWS_ON_GITHUB]->(other:Person)
-OPTIONAL MATCH (other)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
-WITH stars, collect({
+CALL {
+  WITH other
+  OPTIONAL MATCH (other)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
+  RETURN
+    head(collect(DISTINCT gh.handle))      AS gh_handle,
+    head(collect(DISTINCT gh.profile_url)) AS gh_url
+}
+WITH stars, collect(DISTINCT {
   type: 'FOLLOWS_ON_GITHUB',
   followed_name: other.display_name,
-  followed_handle: gh.handle,
-  followed_url: gh.profile_url,
+  followed_handle: gh_handle,
+  followed_url: gh_url,
   first_seen_at: f.first_seen_at
 })[0..15] AS follows
 RETURN stars, follows
@@ -140,11 +174,15 @@ PERSON_INBOUND_SIGNALS = """
 MATCH (target:Person {canonical_id: $id})
 OPTIONAL MATCH (w:Person)-[f:FOLLOWS_ON_GITHUB]->(target)
 WHERE (w)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
-OPTIONAL MATCH (w)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
+CALL {
+  WITH w
+  OPTIONAL MATCH (w)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
+  RETURN head(collect(DISTINCT gh.handle)) AS watcher_gh_handle
+}
 WITH target, collect(DISTINCT {
   watcher_id: w.canonical_id,
   watcher_name: w.display_name,
-  watcher_github: gh.handle,
+  watcher_github: watcher_gh_handle,
   type: 'FOLLOWS_ON_GITHUB',
   first_seen_at: f.first_seen_at
 }) AS inbound_follows
@@ -158,18 +196,23 @@ RETURN inbound_follows
 
 GRAPH_NODES = """
 MATCH (p:Person)-[w:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
-OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
-OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(tw:PlatformIdentity {platform: 'twitter'})
-OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(li:PlatformIdentity {platform: 'linkedin'})
+CALL {
+  WITH p
+  OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(i:PlatformIdentity)
+  RETURN
+    head(collect(DISTINCT CASE WHEN i.platform='github'   THEN i.handle      END)) AS github_handle,
+    head(collect(DISTINCT CASE WHEN i.platform='twitter'  THEN i.handle      END)) AS twitter_handle,
+    head(collect(DISTINCT CASE WHEN i.platform='linkedin' THEN i.profile_url END)) AS linkedin_url
+}
 RETURN
   p.canonical_id  AS id,
   p.display_name  AS name,
   p.investor_type AS investor_type,
   w.archetype     AS archetype,
   p.country       AS country,
-  gh.handle       AS github_handle,
-  tw.handle       AS twitter_handle,
-  li.profile_url  AS linkedin_url,
+  github_handle,
+  twitter_handle,
+  linkedin_url,
   'investor'      AS kind
 """
 
@@ -177,16 +220,21 @@ GRAPH_EDGES = """
 MATCH (w:Person)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
 MATCH (w)-[edge:FOLLOWS_ON_GITHUB]->(target:Person)
 WHERE NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+  AND coalesce(target.entity_type, 'User') = 'User'
 WITH target, w, edge
 WITH target,
      collect({watcher: w, edge_first_seen: edge.first_seen_at}) AS watchers
 WHERE size(watchers) >= $min_watchers
 UNWIND watchers AS w_entry
-OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
+CALL {
+  WITH target
+  OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
+  RETURN head(collect(DISTINCT gh.handle)) AS founder_github
+}
 RETURN
   target.canonical_id AS founder_id,
   target.display_name AS founder_name,
-  gh.handle           AS founder_github,
+  founder_github,
   w_entry.watcher.canonical_id AS watcher_id,
   w_entry.watcher.display_name AS watcher_name,
   w_entry.edge_first_seen      AS first_seen_at

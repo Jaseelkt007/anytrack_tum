@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from intelligence.convergence import (
     aggregate,
     compute_score,
+    compute_target_prominence,
     _parse_iso,
 )
 from intelligence.rule import AlertRule
@@ -208,6 +209,239 @@ def test_aggregate_min_score_filter():
     print("  OK  min_score filter applied")
 
 
+def test_known_signal_types_includes_twitter():
+    from intelligence.rule import KNOWN_SIGNAL_TYPES
+    assert "FOLLOWS_ON_TWITTER" in KNOWN_SIGNAL_TYPES
+    print("  OK  KNOWN_SIGNAL_TYPES includes FOLLOWS_ON_TWITTER")
+
+
+def test_aggregate_twitter_only_convergence():
+    """t_twitter has 2 distinct watchers, both via FOLLOWS_ON_TWITTER -> fires."""
+    rows = [
+        {"target": {"canonical_id": "t_twitter", "display_name": "TwitterOnly"},
+         "w": {"canonical_id": "wA", "display_name": "WatcherA"},
+         "edge_at": "2024-02-10T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_TWITTER",
+         "repo_full_name": None, "repo_url": None,
+         "evidence_url": "https://x.com/WatcherA/following",
+         "edge_confidence": 0.91},
+        {"target": {"canonical_id": "t_twitter", "display_name": "TwitterOnly"},
+         "w": {"canonical_id": "wB", "display_name": "WatcherB"},
+         "edge_at": "2024-02-15T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_TWITTER",
+         "repo_full_name": None, "repo_url": None,
+         "evidence_url": "https://x.com/WatcherB/following",
+         "edge_confidence": 0.91},
+    ]
+    events = aggregate(rows, user_id="demo",
+                       window_start="2024-01-01T00:00:00+00:00",
+                       window_end="2024-03-01T00:00:00+00:00",
+                       window_days=60, rule=_rule(min_members=2))
+    assert len(events) == 1, f"expected 1 twitter-only event, got {len(events)}"
+    e = events[0]
+    assert e.target_id == "t_twitter"
+    assert e.distinct_member_count == 2
+    assert e.signal_type_counts == {"FOLLOWS_ON_TWITTER": 2}
+    print(f"  OK  twitter-only convergence fires (N=2, score={e.score:.2f})")
+
+
+def test_aggregate_mixed_source_github_and_twitter():
+    """t_mixed has 2 distinct watchers — 1 via GitHub follow, 1 via Twitter follow."""
+    rows = [
+        {"target": {"canonical_id": "t_mixed", "display_name": "MixedSource"},
+         "w": {"canonical_id": "wG", "display_name": "GhWatcher"},
+         "edge_at": "2024-02-10T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_GITHUB",
+         "repo_full_name": None, "repo_url": None,
+         "evidence_url": None, "edge_confidence": None},
+        {"target": {"canonical_id": "t_mixed", "display_name": "MixedSource"},
+         "w": {"canonical_id": "wT", "display_name": "TwWatcher"},
+         "edge_at": "2024-02-12T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_TWITTER",
+         "repo_full_name": None, "repo_url": None,
+         "evidence_url": "https://x.com/TwWatcher/following",
+         "edge_confidence": 0.91},
+    ]
+    events = aggregate(rows, user_id="demo",
+                       window_start="2024-01-01T00:00:00+00:00",
+                       window_end="2024-03-01T00:00:00+00:00",
+                       window_days=60, rule=_rule(min_members=2))
+    assert len(events) == 1, f"expected 1 mixed event, got {len(events)}"
+    e = events[0]
+    assert e.distinct_member_count == 2
+    assert e.signal_type_counts == {"FOLLOWS_ON_GITHUB": 1, "FOLLOWS_ON_TWITTER": 1}
+    print("  OK  mixed-source convergence fires (1 github + 1 twitter = N=2)")
+
+
+def test_aggregate_signal_types_excludes_twitter():
+    """Same twitter-only rows; rule restricts to GitHub-only signal types -> NO event."""
+    rows = [
+        {"target": {"canonical_id": "t_t", "display_name": "T"},
+         "w": {"canonical_id": "wA", "display_name": "A"},
+         "edge_at": "2024-02-10T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_TWITTER",
+         "repo_full_name": None, "repo_url": None,
+         "evidence_url": "https://x.com/A/following", "edge_confidence": 0.91},
+        {"target": {"canonical_id": "t_t", "display_name": "T"},
+         "w": {"canonical_id": "wB", "display_name": "B"},
+         "edge_at": "2024-02-12T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_TWITTER",
+         "repo_full_name": None, "repo_url": None,
+         "evidence_url": "https://x.com/B/following", "edge_confidence": 0.91},
+    ]
+    rule_no_tw = _rule(min_members=2,
+                       signal_types=["FOLLOWS_ON_GITHUB", "STARRED_REPO"])
+    events = aggregate(rows, user_id="demo",
+                       window_start="2024-01-01T00:00:00+00:00",
+                       window_end="2024-03-01T00:00:00+00:00",
+                       window_days=60, rule=rule_no_tw)
+    assert events == [], "twitter-only target should not fire when twitter is excluded"
+    # And when Twitter IS allowed, it does fire:
+    rule_with_tw = _rule(min_members=2,
+                         signal_types=["FOLLOWS_ON_GITHUB", "STARRED_REPO", "FOLLOWS_ON_TWITTER"])
+    events_with = aggregate(rows, user_id="demo",
+                            window_start="2024-01-01T00:00:00+00:00",
+                            window_end="2024-03-01T00:00:00+00:00",
+                            window_days=60, rule=rule_with_tw)
+    assert len(events_with) == 1
+    print("  OK  signal_types filter correctly excludes Twitter-only convergences")
+
+
+def test_aggregate_twitter_evidence_carries_url_and_confidence():
+    """Evidence dicts should preserve evidence_url and edge_confidence for twitter rows
+    so the frontend can render click-through links and confidence badges."""
+    rows = [
+        {"target": {"canonical_id": "t1", "display_name": "T"},
+         "w": {"canonical_id": "wA", "display_name": "A"},
+         "edge_at": "2024-02-10T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_TWITTER",
+         "repo_full_name": None, "repo_url": None,
+         "evidence_url": "https://x.com/A/following",
+         "edge_confidence": 0.91},
+        {"target": {"canonical_id": "t1", "display_name": "T"},
+         "w": {"canonical_id": "wB", "display_name": "B"},
+         "edge_at": "2024-02-12T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_TWITTER",
+         "repo_full_name": None, "repo_url": None,
+         "evidence_url": "https://x.com/B/following",
+         "edge_confidence": 0.76},
+    ]
+    e = aggregate(rows, user_id="demo",
+                  window_start="2024-01-01T00:00:00+00:00",
+                  window_end="2024-03-01T00:00:00+00:00",
+                  window_days=60, rule=_rule(min_members=2))[0]
+    urls = sorted(ev["evidence_url"] for ev in e.evidence)
+    assert urls == ["https://x.com/A/following", "https://x.com/B/following"]
+    confidences = sorted(ev["edge_confidence"] for ev in e.evidence)
+    assert confidences == [0.76, 0.91]
+    print("  OK  twitter evidence preserves evidence_url and edge_confidence")
+
+
+def test_aggregate_dedupes_watcher_across_signal_types():
+    """Same watcher contributing via both GitHub follow AND Twitter follow counts once."""
+    rows = [
+        {"target": {"canonical_id": "t1", "display_name": "T"},
+         "w": {"canonical_id": "wSAME", "display_name": "SameWatcher"},
+         "edge_at": "2024-02-10T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_GITHUB",
+         "repo_full_name": None, "repo_url": None,
+         "evidence_url": None, "edge_confidence": None},
+        {"target": {"canonical_id": "t1", "display_name": "T"},
+         "w": {"canonical_id": "wSAME", "display_name": "SameWatcher"},
+         "edge_at": "2024-02-11T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_TWITTER",
+         "repo_full_name": None, "repo_url": None,
+         "evidence_url": "https://x.com/SameWatcher/following",
+         "edge_confidence": 0.91},
+    ]
+    # min_members=2 — same watcher on two channels should NOT fire (still N=1)
+    events = aggregate(rows, user_id="demo",
+                       window_start="2024-01-01T00:00:00+00:00",
+                       window_end="2024-03-01T00:00:00+00:00",
+                       window_days=60, rule=_rule(min_members=2))
+    assert events == [], "same watcher on 2 channels should still count as N=1"
+    print("  OK  same watcher across signal types is de-duplicated")
+
+
+def test_target_prominence_log_scale():
+    """Bonus is 0 below threshold, ~1 at 100, ~2 at 1000, ~3 at 10000, capped above."""
+    assert compute_target_prominence(0) == 0.0
+    assert compute_target_prominence(50) == 0.0
+    assert abs(compute_target_prominence(100) - 1.004) < 0.01
+    assert abs(compute_target_prominence(1000) - 2.0) < 0.01
+    assert abs(compute_target_prominence(10000) - 3.0) < 0.01
+    # Above the cap, value clamps
+    assert abs(compute_target_prominence(55231) - 3.0) < 0.01
+    assert abs(compute_target_prominence(100000) - 3.0) < 0.01
+    print("  OK  compute_target_prominence: 0 below threshold, log-scaled, capped above 10K")
+
+
+def test_compute_score_with_prominence_zero_weight_matches_old_behavior():
+    """weight_target_prominence=0 -> identical to old 3-component score."""
+    s_no_prom, _ = compute_score(
+        4, "2024-01-01T00:00:00+00:00", "2024-01-01T00:00:00+00:00", 90,
+        weight_target_prominence=0.0, target_prominence_value=3.0,
+    )
+    s_old_shape, _ = compute_score(
+        4, "2024-01-01T00:00:00+00:00", "2024-01-01T00:00:00+00:00", 90,
+    )
+    assert abs(s_no_prom - s_old_shape) < 0.001
+    print("  OK  weight_target_prominence=0 reproduces pre-M12.5 behavior (backwards compat)")
+
+
+def test_compute_score_with_prominence_adds_bonus():
+    """A target with weight=1 + value=3 gets +3 to score."""
+    s_with, breakdown = compute_score(
+        4, "2024-01-01T00:00:00+00:00", "2024-01-01T00:00:00+00:00", 90,
+        weight_target_prominence=1.0, target_prominence_value=3.0,
+    )
+    # 4 (members) + 1 (recency at window_end) + 0 (member_quality) + 3 (prominence) = 8
+    assert abs(s_with - 8.0) < 0.001
+    assert breakdown["target_prominence"] == 3.0
+    print(f"  OK  prominence value 3.0 with weight 1.0 adds 3.0 to score (final={s_with:.2f})")
+
+
+def test_aggregate_uses_prominence_map():
+    """Targets with high owned-repo stars rank above targets without."""
+    rows = [
+        # tA: 2 watchers, no owned repos -> base score 2 + recency
+        {"target": {"canonical_id": "tA", "display_name": "TA"},
+         "w": {"canonical_id": "wa", "display_name": "WA"},
+         "edge_at": "2024-02-25T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_GITHUB", "repo_full_name": None, "repo_url": None},
+        {"target": {"canonical_id": "tA", "display_name": "TA"},
+         "w": {"canonical_id": "wb", "display_name": "WB"},
+         "edge_at": "2024-02-25T00:00:00+00:00",
+         "signal_type": "FOLLOWS_ON_GITHUB", "repo_full_name": None, "repo_url": None},
+        # tB: 2 watchers, owns a 30K-star repo -> base + prominence cap
+        {"target": {"canonical_id": "tB", "display_name": "TB"},
+         "w": {"canonical_id": "wa", "display_name": "WA"},
+         "edge_at": "2024-02-25T00:00:00+00:00",
+         "signal_type": "STARRED_REPO", "repo_full_name": "x/y", "repo_url": "#"},
+        {"target": {"canonical_id": "tB", "display_name": "TB"},
+         "w": {"canonical_id": "wc", "display_name": "WC"},
+         "edge_at": "2024-02-25T00:00:00+00:00",
+         "signal_type": "STARRED_REPO", "repo_full_name": "x/y", "repo_url": "#"},
+    ]
+    rule = _rule(min_members=2)
+    rule.weight_target_prominence = 1.0
+    events = aggregate(rows, user_id="demo",
+                       window_start="2024-01-01T00:00:00+00:00",
+                       window_end="2024-03-01T00:00:00+00:00",
+                       window_days=60, rule=rule,
+                       target_prominence_stars={"tA": 0, "tB": 30000})
+    by_id = {e.target_id: e for e in events}
+    assert by_id["tB"].score > by_id["tA"].score, \
+        f"tB ({by_id['tB'].score}) should outrank tA ({by_id['tA'].score})"
+    # tB should have the cap value (3.0); tA should have 0
+    assert abs(by_id["tB"].score_breakdown["target_prominence"] - 3.0) < 0.01
+    assert by_id["tA"].score_breakdown["target_prominence"] == 0.0
+    # Ordering: tB first (higher score)
+    assert events[0].target_id == "tB"
+    print(f"  OK  aggregate uses prominence map: tB outranks tA "
+          f"({by_id['tB'].score:.2f} > {by_id['tA'].score:.2f})")
+
+
 def test_aggregate_emits_breakdown_and_signal_counts():
     rows = [
         {"target": {"canonical_id": "t1", "display_name": "T1"},
@@ -242,6 +476,16 @@ def main() -> int:
         test_aggregate_event_id_is_stable,
         test_aggregate_filters_signal_types,
         test_aggregate_min_score_filter,
+        test_known_signal_types_includes_twitter,
+        test_aggregate_twitter_only_convergence,
+        test_aggregate_mixed_source_github_and_twitter,
+        test_aggregate_signal_types_excludes_twitter,
+        test_aggregate_twitter_evidence_carries_url_and_confidence,
+        test_aggregate_dedupes_watcher_across_signal_types,
+        test_target_prominence_log_scale,
+        test_compute_score_with_prominence_zero_weight_matches_old_behavior,
+        test_compute_score_with_prominence_adds_bonus,
+        test_aggregate_uses_prominence_map,
         test_aggregate_emits_breakdown_and_signal_counts,
     ]
     print(f"Running {len(tests)} unit tests for intelligence.convergence:")

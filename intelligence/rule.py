@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent.parent
 RULES_FILE = ROOT / "data" / "alert_rules.json"
 
 # Signal types the detector currently knows about. Extend as new edge types ship.
-KNOWN_SIGNAL_TYPES = ("FOLLOWS_ON_GITHUB", "STARRED_REPO")
+KNOWN_SIGNAL_TYPES = ("FOLLOWS_ON_GITHUB", "STARRED_REPO", "FOLLOWS_ON_TWITTER")
 KNOWN_SORT_KEYS = ("score", "watcher_count", "recency")
 
 
@@ -40,12 +40,19 @@ class AlertRule:
     # Scoring weights (linear combination)
     weight_distinct_members: float = 1.0
     weight_recency: float = 1.0
-    weight_member_quality: float = 0.0     # placeholder — Phase 2 attaches Bayesian here
+    weight_member_quality: float = 0.0     # placeholder — M11 attaches Bayesian here
+    # GitHub-prominence boost: bonus for targets who own a high-star repo. Per
+    # Omar's "for OSS, when very high value people start a repo it's exceptional"
+    # framing. Bonus is log-scaled and capped to avoid runaway weighting.
+    weight_target_prominence: float = 1.0
+    prominence_min_stars: int = 100        # below this, bonus = 0
+    prominence_max_stars_cap: int = 10000  # at/above this, bonus is capped
 
     # Filters
     exclude_active_watchers: bool = True   # don't fire on a watcher being followed by other watchers
     min_score: float = 0.0
     role_tag_filter: list[str] = field(default_factory=list)  # empty = all roles
+    twitter_signal_min_confidence: float = 0.0  # filter out FOLLOWS_ON_TWITTER edges below this confidence
 
     # Output shaping
     sort_by: str = "score"                  # one of KNOWN_SORT_KEYS
@@ -69,9 +76,16 @@ class AlertRule:
             errs.append(f"sort_by must be one of {list(KNOWN_SORT_KEYS)}")
         if self.limit < 1 or self.limit > 1000:
             errs.append("limit must be in [1, 1000]")
-        for w_name in ("weight_distinct_members", "weight_recency", "weight_member_quality"):
+        for w_name in ("weight_distinct_members", "weight_recency",
+                       "weight_member_quality", "weight_target_prominence"):
             if getattr(self, w_name) < 0:
                 errs.append(f"{w_name} must be >= 0")
+        if not (0.0 <= self.twitter_signal_min_confidence <= 1.0):
+            errs.append("twitter_signal_min_confidence must be in [0, 1]")
+        if self.prominence_min_stars < 0:
+            errs.append("prominence_min_stars must be >= 0")
+        if self.prominence_max_stars_cap < self.prominence_min_stars:
+            errs.append("prominence_max_stars_cap must be >= prominence_min_stars")
         return errs
 
     def to_dict(self) -> dict[str, Any]:

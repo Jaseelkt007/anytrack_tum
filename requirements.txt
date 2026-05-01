@@ -17,6 +17,9 @@ pydantic==2.10.4
 # --- Phase 2 / M7 identity resolver (LLM arbitration via Gemini) ---
 google-generativeai==0.8.3
 
+# --- Phase 2 / M12 pipeline scheduler ---
+APScheduler==3.10.4
+
 # --- Dev / testing ---
 pytest==8.3.4
 ruff==0.8.4

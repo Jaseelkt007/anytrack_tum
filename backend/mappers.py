@@ -144,6 +144,68 @@ def map_signal(*, founder_id: str, founder_handle: Optional[str], signal: dict[s
 
 # --- ConvergenceAlert mapper ------------------------------------------------
 
+_PROMINENCE_LABEL = "GitHub repo prominence"
+
+
+def explain_score(breakdown: dict, *,
+                  distinct_member_count: int,
+                  target_prominence_stars: int = 0) -> list[dict[str, Any]]:
+    """Turn a raw score_breakdown dict into UI-friendly bullet items.
+
+    Each item: { key, label, value, description }. The frontend can render
+    this as a tooltip / expandable list without needing to know the formula.
+    """
+    items: list[dict[str, Any]] = []
+    if "distinct_members" in breakdown:
+        n = distinct_member_count
+        items.append({
+            "key": "distinct_members",
+            "label": "Distinct watchers",
+            "value": float(breakdown.get("distinct_members") or 0.0),
+            "description": (
+                f"{n} watcher{'s' if n != 1 else ''} from your network "
+                f"engaged with this target within the time window"
+            ),
+        })
+    if "recency" in breakdown:
+        rec = float(breakdown.get("recency") or 0.0)
+        if rec >= 0.66:
+            phrase = "very recent — most of the engagement is near the end of the window"
+        elif rec >= 0.33:
+            phrase = "moderate — engagement is mid-window"
+        else:
+            phrase = "older — engagement is near the start of the window"
+        items.append({
+            "key": "recency",
+            "label": "Recency",
+            "value": rec,
+            "description": phrase,
+        })
+    if "target_prominence" in breakdown and float(breakdown.get("target_prominence") or 0.0) > 0:
+        items.append({
+            "key": "target_prominence",
+            "label": _PROMINENCE_LABEL,
+            "value": float(breakdown.get("target_prominence") or 0.0),
+            "description": (
+                f"Target owns a repo with ~{target_prominence_stars:,} stars"
+                if target_prominence_stars else
+                "Target owns a high-star repository on GitHub"
+            ),
+        })
+    if "member_quality" in breakdown:
+        v = float(breakdown.get("member_quality") or 0.0)
+        items.append({
+            "key": "member_quality",
+            "label": "Watcher quality",
+            "value": v,
+            "description": (
+                "Bayesian per-watcher precision — currently a placeholder (0.0); "
+                "fills in once we have outcome labels (M11)"
+            ),
+        })
+    return items
+
+
 def map_alert(row: dict[str, Any], *, window_days: int = 90, rank: Optional[int] = None) -> dict[str, Any]:
     """Map a ConvergenceEvent row + decoded evidence_json into a frontend ConvergenceAlert.
 
@@ -199,6 +261,11 @@ def map_alert(row: dict[str, Any], *, window_days: int = 90, rank: Optional[int]
         "meta": {
             "score":            float(row.get("score") or 0.0),
             "scoreBreakdown":   breakdown,
+            "scoreExplanation": explain_score(
+                breakdown,
+                distinct_member_count=int(row.get("distinct_watchers") or 0),
+                target_prominence_stars=int(row.get("target_prominence_stars") or 0),
+            ),
             "rank":             rank,
             "distinctMembers":  int(row.get("distinct_watchers") or 0),
             "firstSignalAt":    _iso(row.get("first_signal_at")),

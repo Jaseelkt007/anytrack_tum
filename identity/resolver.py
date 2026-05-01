@@ -155,6 +155,18 @@ class Resolver:
         profile_blob = profile_blob or {}
         handle_norm = handle.strip().lstrip("@")
 
+        # Tier 0: this exact (platform, handle) is already a known PlatformIdentity.
+        # Without this short-circuit, re-running the resolver on the same input
+        # could produce a different canonical_id when Tier 3 (LLM) is non-deterministic,
+        # creating duplicate Persons and edges across runs.
+        existing_self = self.identity_lookup.find_canonical_id(platform, handle_norm)
+        if existing_self:
+            return ResolveResult(
+                canonical_id=existing_self, tier="known",
+                confidence=1.0,
+                reasoning=f"{platform}:{handle_norm} is already in the graph",
+            )
+
         # Tier 1: override
         cid = self.overrides.lookup(platform, handle_norm)
         if cid:

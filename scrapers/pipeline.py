@@ -97,18 +97,23 @@ def ingest_follows(session, client: GitHubClient, watcher: dict, now_iso: str,
                    max_pages: int | None) -> int:
     handle = watcher["github_handle"]
     follows = 0
+    skipped_non_user = 0
     for entry in fetch_following(client, handle, max_pages=max_pages):
+        # Orgs / bots are noise, not founder candidates. Skip them at the boundary
+        # so they never enter the Person space.
+        if entry.type != "User":
+            skipped_non_user += 1
+            continue
         followed_id = cypher.github_person_id(entry.handle)
-        # Upsert the followed Person + their github identity.
         session.run(
             cypher.UPSERT_PERSON_BY_GITHUB,
             canonical_id=followed_id,
             handle=entry.handle,
             profile_url=entry.profile_url,
             display_name=entry.handle,  # bare handle until enriched
+            kind=entry.type,
             now_iso=now_iso,
         )
-        # Watcher -> followed edge.
         session.run(
             cypher.MERGE_FOLLOWS_GITHUB,
             watcher_id=watcher["canonical_id"],
@@ -116,12 +121,69 @@ def ingest_follows(session, client: GitHubClient, watcher: dict, now_iso: str,
             now_iso=now_iso,
         )
         follows += 1
+    if skipped_non_user:
+        logger.info("skipped %d non-User follows for %s", skipped_non_user, handle)
     return follows
+
+
+def _run_twitter_stage(driver, user_id: str, max_pages: int) -> tuple[int, int]:
+    """Run the Scrapebadger ingest for tier='active' + reference-angel twitter handles,
+    then load any new signals into Neo4j. Returns (signals_emitted, edges_upserted).
+
+    Designed to be cheap on second runs (idempotent); first run baselines snapshots.
+    """
+    import subprocess
+    from scrapers.jobs.load_twitter_signals_to_neo4j import load_signals
+
+    watchlist_path = ROOT / "data" / "twitter_vc_watchlist.txt"
+    targets_path = ROOT / "data" / "twitter_interesting_people.txt"
+    snapshot_dir = ROOT / "data" / "scrapebadger_twitter_snapshots"
+    signals_path = ROOT / "data" / "scrapebadger_twitter_follow_signals.jsonl"
+
+    if not watchlist_path.exists():
+        print(f"WARN: {watchlist_path} not found — skipping twitter stage. "
+              "Run scripts/build_twitter_watchlist.py first.", file=sys.stderr)
+        return 0, 0
+
+    cli = [
+        sys.executable,
+        str(ROOT / "scripts" / "track_scrapebadger_twitter_follows.py"),
+        "--watchlist", str(watchlist_path),
+        "--snapshot-dir", str(snapshot_dir),
+        "--signals-file", str(signals_path),
+        "--max-pages", str(max_pages),
+    ]
+    if targets_path.exists():
+        cli += ["--targets", str(targets_path)]
+    print(f"\n--- Twitter stage (Scrapebadger) ---")
+    proc = subprocess.run(cli, check=False)
+    if proc.returncode != 0:
+        print(f"WARN: twitter ingest CLI exit code {proc.returncode}", file=sys.stderr)
+
+    # Count signals after the run; load any new ones to Neo4j.
+    signals_count = 0
+    if signals_path.exists():
+        with signals_path.open() as f:
+            signals_count = sum(1 for line in f if line.strip())
+
+    edges_upserted = 0
+    with driver.session() as session:
+        load_result = load_signals(session, signals_path)
+    edges_upserted = load_result.edges_upserted
+    print(f"Twitter signals on disk: {signals_count}; edges upserted this run: {edges_upserted}")
+    if load_result.skipped_unknown_watcher:
+        print(f"  ({load_result.skipped_unknown_watcher} signals skipped — "
+              "watcher not yet in graph)")
+    if load_result.target_persons_resolved:
+        print(f"  resolver tier counts: {load_result.target_persons_resolved}")
+    return signals_count, edges_upserted
 
 
 def run(user_id: str, limit: int | None, max_pages: int | None,
         skip_stars: bool, skip_follows: bool,
-        only_handles: set[str] | None = None) -> int:
+        only_handles: set[str] | None = None,
+        with_twitter: bool = False,
+        twitter_max_pages: int = 1) -> int:
     try:
         from dotenv import load_dotenv
         from neo4j import GraphDatabase
@@ -178,6 +240,12 @@ def run(user_id: str, limit: int | None, max_pages: int | None,
                 logger.error("failed for %s: %s", label, exc)
                 continue
 
+    if with_twitter:
+        try:
+            _run_twitter_stage(driver, user_id, twitter_max_pages)
+        except Exception as exc:
+            logger.error("twitter stage failed: %s", exc)
+
     driver.close()
 
     print()
@@ -196,6 +264,11 @@ def main() -> int:
                         help="cap pages per fetch (useful for fast iteration)")
     parser.add_argument("--skip-stars", action="store_true")
     parser.add_argument("--skip-follows", action="store_true")
+    parser.add_argument("--with-twitter", action="store_true",
+                        help="Also run the Scrapebadger twitter follow tracker (M8).")
+    parser.add_argument("--twitter-max-pages", type=int, default=1,
+                        help="Pages per twitter handle (default 1 per the brief). "
+                             "Baseline depth and diff depth must match.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -206,7 +279,13 @@ def main() -> int:
     only = None
     if args.only_handles:
         only = {h.strip().lower() for h in args.only_handles.split(",") if h.strip()}
-    return run(args.user_id, args.limit, args.max_pages, args.skip_stars, args.skip_follows, only_handles=only)
+    return run(
+        args.user_id, args.limit, args.max_pages,
+        args.skip_stars, args.skip_follows,
+        only_handles=only,
+        with_twitter=args.with_twitter,
+        twitter_max_pages=args.twitter_max_pages,
+    )
 
 
 if __name__ == "__main__":

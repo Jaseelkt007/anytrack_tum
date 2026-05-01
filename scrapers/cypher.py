@@ -27,20 +27,30 @@ def github_person_id(handle: str) -> str:
 # --- Person + GitHub identity (used for newly-discovered followed users) -----
 
 UPSERT_PERSON_BY_GITHUB = """
-MERGE (i:PlatformIdentity {platform: 'github', handle: $handle})
+// Normalize handle to lowercase so case variants (jakewharton vs JakeWharton)
+// don't create separate PlatformIdentity nodes. Original case is preserved on
+// handle_original for display.
+WITH toLower($handle) AS handle_lc
+MERGE (i:PlatformIdentity {platform: 'github', handle: handle_lc})
 ON CREATE SET
+    i.handle_original   = $handle,
     i.profile_url       = $profile_url,
     i.verified_via      = 'observed',
     i.confidence        = 0.6,
+    i.kind              = $kind,
     i.first_observed_at = datetime($now_iso)
+SET i.kind = coalesce(i.kind, $kind)
 WITH i
 MERGE (p:Person {canonical_id: $canonical_id})
 ON CREATE SET
     p.display_name      = $display_name,
     p.role_tags         = ['observed'],
     p.confidence_score  = 0.6,
+    p.entity_type       = $kind,
     p.first_observed_at = datetime($now_iso)
-SET p.last_observed_at = datetime($now_iso)
+SET
+    p.last_observed_at = datetime($now_iso),
+    p.entity_type      = coalesce(p.entity_type, $kind)
 MERGE (p)-[:HAS_IDENTITY]->(i)
 RETURN p.canonical_id AS canonical_id
 """
@@ -93,6 +103,47 @@ MERGE (p)-[e:OWNS_REPO]->(r)
 ON CREATE SET e.first_seen_at = datetime($now_iso)
 """
 
+# --- Twitter (Phase 2 / M8) --------------------------------------------------
+
+# Person + Twitter identity upsert. Used by the Twitter signal loader after
+# resolving canonical_id via identity.resolver.
+UPSERT_PERSON_BY_TWITTER = """
+WITH toLower($handle) AS handle_lc
+MERGE (i:PlatformIdentity {platform: 'twitter', handle: handle_lc})
+ON CREATE SET
+    i.handle_original   = $handle,
+    i.profile_url       = $profile_url,
+    i.verified_via      = 'observed',
+    i.confidence        = 0.6,
+    i.first_observed_at = datetime($now_iso)
+WITH i
+MERGE (p:Person {canonical_id: $canonical_id})
+ON CREATE SET
+    p.display_name      = $display_name,
+    p.role_tags         = ['observed'],
+    p.confidence_score  = 0.6,
+    p.first_observed_at = datetime($now_iso)
+SET p.last_observed_at = datetime($now_iso),
+    p.display_name = coalesce(p.display_name, $display_name)
+MERGE (p)-[:HAS_IDENTITY]->(i)
+RETURN p.canonical_id AS canonical_id
+"""
+
+# Watcher -> followed Person on Twitter. No real follow timestamp; first_seen_at
+# is the observation time of the snapshot diff. Append-only: never DELETEd.
+MERGE_FOLLOWS_TWITTER = """
+MATCH (watcher:Person {canonical_id: $watcher_id})
+MATCH (target:Person  {canonical_id: $target_id})
+MERGE (watcher)-[e:FOLLOWS_ON_TWITTER]->(target)
+ON CREATE SET
+    e.first_seen_at = datetime($observed_at),
+    e.confidence    = $confidence,
+    e.evidence_url  = $evidence_url,
+    e.timing_basis  = $timing_basis
+SET e.last_seen_at = datetime($observed_at)
+"""
+
+
 # --- Reads -------------------------------------------------------------------
 
 # Active watchlist with their GitHub handles (driver: pipeline orchestrator)
@@ -103,4 +154,24 @@ RETURN p.canonical_id AS canonical_id,
        p.display_name AS display_name,
        i.handle       AS github_handle
 ORDER BY p.display_name
+"""
+
+# Active + reference angels with their Twitter handles (driver: M8 watchlist build)
+QUERY_TWITTER_WATCHERS = """
+MATCH (p:Person)-[:HAS_IDENTITY]->(i:PlatformIdentity {platform: 'twitter'})
+WHERE
+    EXISTS {
+        MATCH (p)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+    }
+    OR p.investor_type = 'Angel'
+RETURN DISTINCT p.canonical_id AS canonical_id,
+                p.display_name AS display_name,
+                i.handle       AS twitter_handle
+ORDER BY p.display_name
+"""
+
+# Look up a watcher's canonical_id by their twitter handle (driver: signal loader)
+QUERY_PERSON_BY_TWITTER_HANDLE = """
+MATCH (p:Person)-[:HAS_IDENTITY]->(i:PlatformIdentity {platform: 'twitter', handle: $handle})
+RETURN p.canonical_id AS canonical_id LIMIT 1
 """

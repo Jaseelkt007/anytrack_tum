@@ -194,6 +194,34 @@ def test_namespace_unchanged():
     print("  OK  NAMESPACE UUID is the same constant as Phase 1")
 
 
+# --- Resolver tier 0 (known) ------------------------------------------------
+
+def test_resolver_tier0_known_identity_short_circuits():
+    """If (platform, handle) is already in the graph, return its canonical_id
+    immediately — without consulting overrides, bio-links, or the LLM."""
+    arbiter = FakeLLMArbiter(LLMVerdict("same", 1.0, "should not run", "x"))
+    resolver, arb = _make_resolver(
+        lookup={("twitter", "antonosika"): "anton-existing-id"},
+        candidates=[],  # would otherwise be empty -> fresh
+        arbiter=arbiter,
+    )
+    result = resolver.resolve("twitter", "antonosika", {"display_name": "Anton Osika"})
+    assert result.tier == "known", result.tier
+    assert result.canonical_id == "anton-existing-id"
+    assert arb.calls == [], "LLM must never be called when Tier 0 hits"
+    print("  OK  Resolver Tier 0: known identity short-circuits, LLM not invoked")
+
+
+def test_resolver_tier0_idempotent_across_runs():
+    """A single (platform, handle) returns the same canonical_id no matter how
+    many times resolve() is called — guards against LLM non-determinism."""
+    resolver, _ = _make_resolver(lookup={("twitter", "x"): "stable-id"})
+    a = resolver.resolve("twitter", "x", {})
+    b = resolver.resolve("twitter", "x", {"display_name": "Different blob"})
+    assert a.canonical_id == b.canonical_id == "stable-id"
+    print("  OK  Resolver Tier 0: idempotent across re-resolves of same identity")
+
+
 # --- Resolver tier 1 (override) ---------------------------------------------
 
 def test_resolver_tier1_override_hit():
@@ -392,6 +420,8 @@ TESTS = [
     test_override_missing_csv_safe,
     test_platform_person_id_matches_phase1_github,
     test_namespace_unchanged,
+    test_resolver_tier0_known_identity_short_circuits,
+    test_resolver_tier0_idempotent_across_runs,
     test_resolver_tier1_override_hit,
     test_resolver_tier2_bio_link_hit,
     test_resolver_tier2_self_reference_skipped,

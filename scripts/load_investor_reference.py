@@ -122,8 +122,10 @@ RETURN p.canonical_id AS id
 # linkedin: MERGE on (platform, handle) which is uniqueness-constrained.
 CYPHER_LINKEDIN_IDENTITY = """
 MATCH (p:Person {canonical_id: $canonical_id})
-MERGE (i:PlatformIdentity {platform: 'linkedin', handle: $linkedin_slug})
+WITH p, toLower($linkedin_slug) AS handle_lc
+MERGE (i:PlatformIdentity {platform: 'linkedin', handle: handle_lc})
 ON CREATE SET
+    i.handle_original  = $linkedin_slug,
     i.profile_url      = $linkedin_url,
     i.verified_via     = 'csv_import',
     i.confidence       = 0.9,
@@ -133,8 +135,10 @@ MERGE (p)-[:HAS_IDENTITY]->(i)
 
 CYPHER_TWITTER_IDENTITY = """
 MATCH (p:Person {canonical_id: $canonical_id})
-MERGE (i:PlatformIdentity {platform: 'twitter', handle: $twitter_handle})
+WITH p, toLower($twitter_handle) AS handle_lc
+MERGE (i:PlatformIdentity {platform: 'twitter', handle: handle_lc})
 ON CREATE SET
+    i.handle_original  = $twitter_handle,
     i.profile_url      = $twitter_url,
     i.verified_via     = 'csv_import',
     i.confidence       = 0.9,

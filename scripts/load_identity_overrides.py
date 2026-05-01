@@ -43,8 +43,10 @@ SET
 
 UPSERT_IDENTITY = """
 MATCH (p:Person {canonical_id: $canonical_id})
-MERGE (i:PlatformIdentity {platform: $platform, handle: $handle})
+WITH p, toLower($handle) AS handle_lc
+MERGE (i:PlatformIdentity {platform: $platform, handle: handle_lc})
 ON CREATE SET
+    i.handle_original   = $handle,
     i.profile_url       = $profile_url,
     i.verified_via      = 'manual',
     i.confidence        = 1.0,

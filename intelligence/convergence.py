@@ -73,9 +73,11 @@ MATCH (w)-[edge:FOLLOWS_ON_GITHUB]->(target:Person)
 WHERE edge.first_seen_at >= datetime($window_start)
   AND edge.first_seen_at <= datetime($window_end)
   AND NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+  AND coalesce(target.entity_type, 'User') = 'User'
 RETURN target, w, edge.first_seen_at AS edge_at,
        'FOLLOWS_ON_GITHUB' AS signal_type,
-       NULL AS repo_full_name, NULL AS repo_url
+       NULL AS repo_full_name, NULL AS repo_url,
+       NULL AS evidence_url, NULL AS edge_confidence
 
 UNION
 
@@ -87,12 +89,46 @@ WHERE edge.first_seen_at >= datetime($window_start)
   AND edge.first_seen_at <= datetime($window_end)
   AND NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
   AND target <> w
+  AND coalesce(target.entity_type, 'User') = 'User'
 RETURN target, w, edge.first_seen_at AS edge_at,
        'STARRED_REPO' AS signal_type,
-       repo.full_name AS repo_full_name, repo.html_url AS repo_url
+       repo.full_name AS repo_full_name, repo.html_url AS repo_url,
+       repo.html_url AS evidence_url, NULL AS edge_confidence
+
+UNION
+
+// FOLLOWS_ON_TWITTER signals — observed via Scrapebadger snapshot diffs (M8).
+// edge.first_seen_at is the OBSERVATION time, not a real follow timestamp.
+// edge.confidence: 0.91 for diff signals, 0.76 for baseline-existing.
+//
+// Tier semantics differ here vs. the GitHub branches: M8 polls a broader set
+// (the 76 reference angels with twitter handles + active watchers), not just
+// tier='active'. Any watcher with a WATCHED_BY edge contributes their twitter
+// follows. The active-only restriction stays on the TARGET side — we still
+// don't fire on watcher-to-watcher convergence.
+MATCH (w:Person)-[:WATCHED_BY]->(:User {id: $user_id})
+MATCH (w)-[edge:FOLLOWS_ON_TWITTER]->(target:Person)
+WHERE edge.first_seen_at >= datetime($window_start)
+  AND edge.first_seen_at <= datetime($window_end)
+  AND coalesce(edge.confidence, 1.0) >= $twitter_min_confidence
+  AND NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+  AND coalesce(target.entity_type, 'User') = 'User'
+RETURN target, w, edge.first_seen_at AS edge_at,
+       'FOLLOWS_ON_TWITTER' AS signal_type,
+       NULL AS repo_full_name, NULL AS repo_url,
+       edge.evidence_url AS evidence_url, edge.confidence AS edge_confidence
 """
 
 # Aggregation runs in Python (more flexible than UNION+aggregate inside Cypher).
+
+# Per-target max owned-repo star count, for the M12.5 GitHub-prominence bonus.
+QUERY_TARGET_PROMINENCE = """
+MATCH (p:Person)
+WHERE p.canonical_id IN $ids
+OPTIONAL MATCH (p)-[:OWNS_REPO]->(r:Repository)
+RETURN p.canonical_id AS id,
+       max(coalesce(r.star_count_observed, 0)) AS max_stars
+"""
 
 
 # --- ConvergenceEvent persistence -------------------------------------------
@@ -119,17 +155,48 @@ MERGE (c)-[:ABOUT]->(target)
 """
 
 DELETE_STALE_CONVERGENCE_EVENTS = """
-// Remove events that share the same window_end_date as the current run
-// but whose target is not in the new set. Preserves historical snapshots
-// (different date suffix) while keeping the current view in sync with the rule.
+// Drop events that no longer reflect reality. Two failure modes addressed:
+//   (a) the target was promoted to tier='active' since the event fired (watchers
+//       can never be founders);
+//   (b) for events of the *current* window_end_date, the target dropped out of
+//       the new candidate set (rule changed, signals expired, etc.).
+// Historical snapshots from previous windows are preserved EXCEPT when (a) holds.
 MATCH (c:ConvergenceEvent {user_id: $user_id})
-WHERE c.id ENDS WITH $window_end_date
-  AND NOT c.target_person_id IN $current_target_ids
+OPTIONAL MATCH (target:Person {canonical_id: c.target_person_id})
+WITH c, target
+WHERE
+  // (a) target became an active watcher — no longer a valid founder candidate
+  (target IS NOT NULL AND (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id}))
+  OR
+  // (b) current-window event whose target isn't in the freshly-computed set
+  (c.id ENDS WITH $window_end_date AND NOT c.target_person_id IN $current_target_ids)
 DETACH DELETE c
 """
 
 
 # --- Pure-function scoring (testable without Neo4j) ------------------------
+
+def compute_target_prominence(max_owned_repo_stars: int,
+                              *, min_stars: int = 100,
+                              max_cap: int = 10000) -> float:
+    """Log-scaled bonus from the target's most prominent owned repo.
+
+      stars < min_stars  -> 0.0       (noise floor)
+      stars = 100        -> ~1.0      (log10(101) - 1)
+      stars = 1000       -> ~2.0
+      stars = 10000      -> 3.0       (capped at log10(max_cap+1) - 1)
+      stars > max_cap    -> capped value (does not grow further)
+
+    Captures Omar's "very high value OSS == exceptional signal" framing while
+    preventing 100K-star repos from dominating the inbox.
+    """
+    import math
+    if max_owned_repo_stars < min_stars:
+        return 0.0
+    cap_value = math.log10(1 + max_cap) - 1.0
+    raw = math.log10(1 + max_owned_repo_stars) - 1.0
+    return max(0.0, min(cap_value, raw))
+
 
 def compute_score(distinct_member_count: int,
                   newest_edge_iso: Optional[str],
@@ -139,13 +206,16 @@ def compute_score(distinct_member_count: int,
                   weight_distinct_members: float = 1.0,
                   weight_recency: float = 1.0,
                   weight_member_quality: float = 0.0,
-                  member_quality_value: float = 0.0) -> tuple[float, dict[str, float]]:
-    """Phase 1 score = weighted linear combination. Returns (score, breakdown).
+                  member_quality_value: float = 0.0,
+                  weight_target_prominence: float = 0.0,
+                  target_prominence_value: float = 0.0) -> tuple[float, dict[str, float]]:
+    """Score = weighted linear combination. Returns (score, breakdown).
 
     Components:
-      - distinct_members : N distinct watchers (dominant term)
-      - recency          : 0 if oldest edge in window, 1 if at window_end
-      - member_quality   : Phase-2 placeholder (Bayesian precision); 0 in Phase 1
+      - distinct_members  : N distinct watchers (dominant term)
+      - recency           : 0 if newest edge at window_start, 1 if at window_end
+      - member_quality    : per-watcher Bayesian precision (M11 — placeholder 0 today)
+      - target_prominence : log-scaled bonus from target's max owned-repo stars (M12.5)
     """
     recency_value = 0.0
     if newest_edge_iso and window_days > 0:
@@ -158,9 +228,10 @@ def compute_score(distinct_member_count: int,
             pass
 
     breakdown = {
-        "distinct_members": float(distinct_member_count) * weight_distinct_members,
-        "recency":          recency_value * weight_recency,
-        "member_quality":   member_quality_value * weight_member_quality,
+        "distinct_members":  float(distinct_member_count) * weight_distinct_members,
+        "recency":           recency_value * weight_recency,
+        "member_quality":    member_quality_value * weight_member_quality,
+        "target_prominence": target_prominence_value * weight_target_prominence,
     }
     score = sum(breakdown.values())
     return score, breakdown
@@ -195,7 +266,9 @@ def aggregate(rows: list[dict[str, Any]],
               window_start: str,
               window_end: str,
               window_days: int,
-              rule) -> list[ConvergenceEvent]:
+              rule,
+              *,
+              target_prominence_stars: dict[str, int] | None = None) -> list[ConvergenceEvent]:
     """Group raw signal rows by target and produce ConvergenceEvent objects.
 
     `rule` is an intelligence.rule.AlertRule (kept untyped here to avoid a
@@ -239,6 +312,8 @@ def aggregate(rows: list[dict[str, Any]],
             "edge_at":      edge_iso,
             "repo_full_name": r.get("repo_full_name"),
             "repo_url":       r.get("repo_url"),
+            "evidence_url":   r.get("evidence_url"),
+            "edge_confidence": r.get("edge_confidence"),
         })
 
         if signal_type:
@@ -258,12 +333,20 @@ def aggregate(rows: list[dict[str, Any]],
             continue
         member_ids = list(b["members"].keys())
         member_names = list(b["members"].values())
+        prominence_stars = (target_prominence_stars or {}).get(tid, 0)
+        prominence_value = compute_target_prominence(
+            prominence_stars,
+            min_stars=rule.prominence_min_stars,
+            max_cap=rule.prominence_max_stars_cap,
+        )
         score, breakdown = compute_score(
             n, b["newest_iso"], window_end, window_days,
             weight_distinct_members=rule.weight_distinct_members,
             weight_recency=rule.weight_recency,
             weight_member_quality=rule.weight_member_quality,
-            member_quality_value=0.0,    # Phase 2 hook
+            member_quality_value=0.0,    # M11 hook
+            weight_target_prominence=rule.weight_target_prominence,
+            target_prominence_value=prominence_value,
         )
         if score < rule.min_score:
             continue
@@ -329,13 +412,17 @@ def find_convergences(driver, *, user_id: str = "demo",
             user_id=user_id,
             window_start=window_start,
             window_end=window_end,
+            twitter_min_confidence=rule.twitter_signal_min_confidence,
         ))
 
     raw: list[dict[str, Any]] = []
+    target_ids: set[str] = set()
     for r in rows:
         d = dict(r)
         target = d.get("target")
         watcher = d.get("w")
+        if target:
+            target_ids.add(dict(target).get("canonical_id"))
         raw.append({
             "target":         dict(target) if target else None,
             "w":              dict(watcher) if watcher else None,
@@ -343,10 +430,24 @@ def find_convergences(driver, *, user_id: str = "demo",
             "signal_type":    d.get("signal_type"),
             "repo_full_name": d.get("repo_full_name"),
             "repo_url":       d.get("repo_url"),
+            "evidence_url":   d.get("evidence_url"),
+            "edge_confidence": d.get("edge_confidence"),
         })
 
+    # M12.5: batch-fetch each target's max owned-repo star count for the
+    # GitHub-prominence score component. Single Cypher round-trip.
+    target_prominence_stars: dict[str, int] = {}
+    if target_ids:
+        with driver.session() as session:
+            prom_rows = session.run(QUERY_TARGET_PROMINENCE,
+                                    ids=list(target_ids)).data()
+        target_prominence_stars = {r["id"]: int(r["max_stars"] or 0)
+                                    for r in prom_rows}
+
     return aggregate(raw, user_id=user_id, window_start=window_start,
-                     window_end=window_end, window_days=rule.window_days, rule=rule)
+                     window_end=window_end, window_days=rule.window_days,
+                     rule=rule,
+                     target_prominence_stars=target_prominence_stars)
 
 
 def persist_events(driver, events: list[ConvergenceEvent], *, user_id: str, window_end_iso: str) -> None:
