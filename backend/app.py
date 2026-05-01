@@ -95,12 +95,18 @@ app = FastAPI(
 
 # --- CORS -------------------------------------------------------------------
 # Permissive — Lovable preview origins are not stable, and ngrok handles auth.
+# Must allow PUT/POST/PATCH/DELETE so write endpoints (alert-rule, feedback,
+# dossier regenerate, notifier send-now, pipeline run) survive the browser
+# preflight check. With allow_credentials=False, '*' is valid for origins.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
+    allow_origin_regex=r"https://.*\.(lovableproject\.com|lovable\.app)",
     allow_credentials=False,
-    allow_methods=["GET", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=600,
 )
 
 
@@ -393,9 +399,9 @@ def person_detail(person_id: str) -> dict[str, Any]:
         if head is None:
             raise HTTPException(status_code=404, detail="Person not found")
         head_d = dict(head)
-        is_active = head_d.get("watch_tier") == "active"
+        is_investor = head_d.get("watch_tier") in ("active", "vip")
 
-    if is_active:
+    if is_investor:
         return map_investor({
             "id":              head_d["id"],
             "name":            head_d["name"],

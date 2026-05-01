@@ -2,6 +2,15 @@
 
 All queries assume Phase 1 schema (see scripts/schema.cypher) and the M2/M2.5/M3
 data state. They are read-only.
+
+Watchlist-tier semantics:
+  - 'active': pollable watchers (have a github identity; pipeline ingests their
+              follows/stars). They are both displayed AND used as signal sources.
+  - 'vip':    important investors we want visible in the UI but cannot poll
+              (e.g. pure-LinkedIn VCs). They are displayed but never used as a
+              signal source. Like 'active', they must NOT appear as founder
+              candidates.
+  - 'reference': the recognition-only set (1000+ rows). Hidden from the UI.
 """
 
 from __future__ import annotations
@@ -14,7 +23,8 @@ HEALTH = "RETURN 1 AS ok"
 # --- Investors (active watchlist members) ----------------------------------
 
 LIST_INVESTORS = """
-MATCH (p:Person)-[w:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+MATCH (p:Person)-[w:WATCHED_BY]->(:User {id: $user_id})
+WHERE w.tier IN ['active', 'vip']
 CALL {
   WITH p
   OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(i:PlatformIdentity)
@@ -47,7 +57,10 @@ LIST_FOUNDER_CANDIDATES = """
 // stale-event purge in intelligence/convergence.py also removes those).
 MATCH (c:ConvergenceEvent {user_id: $user_id})-[:ABOUT]->(target:Person)
 WHERE c.distinct_member_count >= $min_watchers
-  AND NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+  AND NOT EXISTS {
+    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
+    WHERE wx.tier IN ['active', 'vip']
+  }
   AND coalesce(target.entity_type, 'User') = 'User'
 CALL {
   WITH target
@@ -80,7 +93,10 @@ LIST_CONVERGENCE_SIGNALS = """
 // Read from persisted ConvergenceEvent nodes; signals come from evidence_json.
 MATCH (c:ConvergenceEvent {user_id: $user_id})-[:ABOUT]->(target:Person)
 WHERE c.distinct_member_count >= $min_watchers
-  AND NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+  AND NOT EXISTS {
+    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
+    WHERE wx.tier IN ['active', 'vip']
+  }
   AND coalesce(target.entity_type, 'User') = 'User'
 CALL {
   WITH target
@@ -195,7 +211,8 @@ RETURN inbound_follows
 # Capped to keep React Flow snappy.
 
 GRAPH_NODES = """
-MATCH (p:Person)-[w:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+MATCH (p:Person)-[w:WATCHED_BY]->(:User {id: $user_id})
+WHERE w.tier IN ['active', 'vip']
 CALL {
   WITH p
   OPTIONAL MATCH (p)-[:HAS_IDENTITY]->(i:PlatformIdentity)
@@ -219,7 +236,10 @@ RETURN
 GRAPH_EDGES = """
 MATCH (w:Person)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
 MATCH (w)-[edge:FOLLOWS_ON_GITHUB]->(target:Person)
-WHERE NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+WHERE NOT EXISTS {
+    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
+    WHERE wx.tier IN ['active', 'vip']
+  }
   AND coalesce(target.entity_type, 'User') = 'User'
 WITH target, w, edge
 WITH target,

@@ -72,7 +72,10 @@ MATCH (w:Person)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
 MATCH (w)-[edge:FOLLOWS_ON_GITHUB]->(target:Person)
 WHERE edge.first_seen_at >= datetime($window_start)
   AND edge.first_seen_at <= datetime($window_end)
-  AND NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+  AND NOT EXISTS {
+    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
+    WHERE wx.tier IN ['active', 'vip']
+  }
   AND coalesce(target.entity_type, 'User') = 'User'
 RETURN target, w, edge.first_seen_at AS edge_at,
        'FOLLOWS_ON_GITHUB' AS signal_type,
@@ -87,7 +90,10 @@ MATCH (w)-[edge:STARRED_REPO]->(repo:Repository)
 MATCH (target:Person)-[:OWNS_REPO]->(repo)
 WHERE edge.first_seen_at >= datetime($window_start)
   AND edge.first_seen_at <= datetime($window_end)
-  AND NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+  AND NOT EXISTS {
+    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
+    WHERE wx.tier IN ['active', 'vip']
+  }
   AND target <> w
   AND coalesce(target.entity_type, 'User') = 'User'
 RETURN target, w, edge.first_seen_at AS edge_at,
@@ -111,7 +117,10 @@ MATCH (w)-[edge:FOLLOWS_ON_TWITTER]->(target:Person)
 WHERE edge.first_seen_at >= datetime($window_start)
   AND edge.first_seen_at <= datetime($window_end)
   AND coalesce(edge.confidence, 1.0) >= $twitter_min_confidence
-  AND NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
+  AND NOT EXISTS {
+    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
+    WHERE wx.tier IN ['active', 'vip']
+  }
   AND coalesce(target.entity_type, 'User') = 'User'
 RETURN target, w, edge.first_seen_at AS edge_at,
        'FOLLOWS_ON_TWITTER' AS signal_type,
@@ -165,8 +174,11 @@ MATCH (c:ConvergenceEvent {user_id: $user_id})
 OPTIONAL MATCH (target:Person {canonical_id: c.target_person_id})
 WITH c, target
 WHERE
-  // (a) target became an active watcher — no longer a valid founder candidate
-  (target IS NOT NULL AND (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id}))
+  // (a) target became a watchlist member ('active' or 'vip') — no longer a valid founder candidate
+  (target IS NOT NULL AND EXISTS {
+    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
+    WHERE wx.tier IN ['active', 'vip']
+  })
   OR
   // (b) current-window event whose target isn't in the freshly-computed set
   (c.id ENDS WITH $window_end_date AND NOT c.target_person_id IN $current_target_ids)
