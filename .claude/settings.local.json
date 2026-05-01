@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git init *)",
+      "Bash(python3 -m py_compile scripts/healthcheck.py scripts/apply_schema.py)",
+      "Bash(python3 *)",
+      "Bash(git add *)",
+      "Bash(git check-ignore *)",
+      "Bash(git rm *)",
+      "Bash(curl -s http://127.0.0.1:8000/api/investors)",
+      "Bash(python -m json.tool)",
+      "Bash(curl -s http://127.0.0.1:8000/api/founders)",
+      "Bash(python -c ' *)",
+      "Bash(curl -s -o /dev/null -w \"HTTP %{http_code}\\\\n\" http://127.0.0.1:8000/api/person/no-such-id)",
+      "Bash(curl -s -X PUT http://127.0.0.1:8000/api/alert-rule -H \"Content-Type: application/json\" -d '{\"signal_types\":[\"FOLLOWS_ON_GITHUB\"]}')",
+      "Bash(curl -s -X POST http://127.0.0.1:8000/api/alerts/recompute)",
+      "Bash(curl -s http://127.0.0.1:8000/api/alerts)",
+      "Bash(python scripts/backfill_identity_resolver.py --no-llm)",
+      "Bash(/mnt/d/tum_ai/.venv/bin/python *)",
+      "Bash(/mnt/d/tum_ai/.venv/bin/pip install *)"
+    ]
+  }
+}
