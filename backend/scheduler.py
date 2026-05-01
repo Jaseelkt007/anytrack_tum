@@ -300,13 +300,123 @@ def _stage_dossier_sweep() -> dict:
     return stats
 
 
+# --- Email digest job (M12-email) ----------------------------------------
+
+_digest_lock = threading.Lock()
+DIGEST_STATUS_FILE = ROOT / "data" / "last_digest_run.json"
+
+
+def _read_digest_status() -> dict:
+    if not DIGEST_STATUS_FILE.exists():
+        return {}
+    try:
+        return json.loads(DIGEST_STATUS_FILE.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _write_digest_status(payload: dict) -> None:
+    DIGEST_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    DIGEST_STATUS_FILE.write_text(json.dumps(payload, indent=2, default=str))
+
+
+def get_last_digest_run() -> dict:
+    s = _read_digest_status()
+    s["currently_running"] = _digest_lock.locked()
+    return s
+
+
+def run_email_digest(*, dry_run: bool = False) -> dict:
+    """Send the daily digest. Acquires its own mutex independent of the
+    pipeline lock — both can run simultaneously without conflict.
+    """
+    if not _digest_lock.acquire(blocking=False):
+        logger.info("email digest already running; skipping this tick")
+        return {"skipped": True, "reason": "already_running"}
+
+    started_at = _now_iso()
+    status: dict[str, Any] = {
+        "last_started_at": started_at,
+        "last_status": "running",
+        "dry_run": dry_run,
+    }
+    _write_digest_status(status)
+
+    try:
+        from neo4j import GraphDatabase
+        from intelligence.notifier import send_daily_digest
+        driver = GraphDatabase.driver(
+            os.environ["NEO4J_URI"],
+            auth=(os.environ["NEO4J_USER"], os.environ["NEO4J_PASSWORD"]),
+        )
+        try:
+            with driver.session() as session:
+                result = send_daily_digest(
+                    session, user_id="demo", dry_run=dry_run,
+                )
+        finally:
+            driver.close()
+
+        if result.sent:
+            outcome = "success"
+        elif result.skipped_reason:
+            outcome = f"skipped:{result.skipped_reason}"
+        elif dry_run:
+            outcome = "success:dry_run"
+        else:
+            outcome = "success"
+        status.update({
+            "last_finished_at": _now_iso(),
+            "last_status": outcome,
+            "sent": result.sent,
+            "skipped_reason": result.skipped_reason,
+            "dossier_count": result.dossier_count,
+            "item_summaries": result.item_summaries,
+            "provider_message_id": result.provider_message_id,
+            "sent_at": result.sent_at,
+        })
+        _write_digest_status(status)
+        return status
+    except Exception as e:
+        logger.exception("email digest failed")
+        status.update({
+            "last_finished_at": _now_iso(),
+            "last_status": "failed",
+            "error": f"{type(e).__name__}: {e}",
+        })
+        _write_digest_status(status)
+        return status
+    finally:
+        _digest_lock.release()
+
+
+def trigger_email_digest_now(*, dry_run: bool = False) -> dict:
+    """Kick off a digest run in a background thread. Returns immediately."""
+    if _digest_lock.locked():
+        return {"started": False, "reason": "already_running",
+                "status": get_last_digest_run()}
+    t = threading.Thread(
+        target=run_email_digest, kwargs={"dry_run": dry_run},
+        daemon=True, name="email-digest-manual-trigger",
+    )
+    t.start()
+    return {"started": True, "started_at": _now_iso(), "dry_run": dry_run}
+
+
 # --- Scheduler lifecycle (called from FastAPI lifespan) ------------------
 
 _scheduler = None  # apscheduler.schedulers.background.BackgroundScheduler | None
 
 
 def start_scheduler() -> None:
-    """Start the background scheduler. Idempotent — calling twice is a no-op."""
+    """Start the background scheduler. Idempotent — calling twice is a no-op.
+
+    Registers TWO jobs:
+      1. `pipeline` — every PIPELINE_INTERVAL_HOURS (default 6h): ingest +
+         convergence + dossier sweep
+      2. `email_digest` — every PIPELINE_DIGEST_INTERVAL_HOURS (default 24h):
+         drains the dossier outbox via Resend
+    """
     global _scheduler
     if _scheduler is not None:
         return
@@ -319,6 +429,8 @@ def start_scheduler() -> None:
     interval_hours = float(os.environ.get("PIPELINE_INTERVAL_HOURS", "6"))
     skip_twitter = os.environ.get("PIPELINE_SKIP_TWITTER", "").lower() in ("1", "true", "yes")
     run_on_startup = os.environ.get("PIPELINE_RUN_ON_STARTUP", "").lower() in ("1", "true", "yes")
+    digest_interval_hours = float(os.environ.get("PIPELINE_DIGEST_INTERVAL_HOURS", "24"))
+    digest_disabled = os.environ.get("PIPELINE_DIGEST_DISABLED", "").lower() in ("1", "true", "yes")
 
     sched = BackgroundScheduler(daemon=True, timezone="UTC")
     sched.add_job(
@@ -331,11 +443,23 @@ def start_scheduler() -> None:
         coalesce=True,
         kwargs={"skip_twitter": skip_twitter},
     )
+    if not digest_disabled:
+        sched.add_job(
+            run_email_digest,
+            trigger="interval",
+            hours=digest_interval_hours,
+            id="email_digest",
+            name="daily-email-digest",
+            max_instances=1,
+            coalesce=True,
+        )
     sched.start()
     _scheduler = sched
     logger.info(
-        "pipeline scheduler started (interval=%sh, skip_twitter=%s, run_on_startup=%s)",
-        interval_hours, skip_twitter, run_on_startup,
+        "scheduler started (pipeline=%sh, digest=%sh%s, skip_twitter=%s, run_on_startup=%s)",
+        interval_hours, digest_interval_hours,
+        " [DISABLED]" if digest_disabled else "",
+        skip_twitter, run_on_startup,
     )
 
     if run_on_startup:

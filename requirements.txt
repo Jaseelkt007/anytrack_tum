@@ -20,6 +20,9 @@ google-generativeai==0.8.3
 # --- Phase 2 / M12 pipeline scheduler ---
 APScheduler==3.10.4
 
+# --- Phase 2 / M12-email — Resend digest delivery ---
+resend==2.4.0
+
 # --- Dev / testing ---
 pytest==8.3.4
 ruff==0.8.4

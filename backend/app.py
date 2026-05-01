@@ -176,6 +176,36 @@ def pipeline_status() -> dict[str, Any]:
     return _sched.get_last_run()
 
 
+# --- M12-email Notifier endpoints -----------------------------------------
+
+@app.post("/api/notifier/send-now")
+def notifier_send_now(body: dict[str, Any] = Body(default_factory=dict)) -> dict[str, Any]:
+    """Trigger an immediate email-digest send in the background.
+
+    Body (all optional):
+      dry_run: bool — when true, runs the query and renders HTML but does NOT
+               send the email or flip dossier statuses. Useful for previewing
+               what would go out.
+
+    Returns 200 with {started: true, ...} on success. 409 if a digest run is
+    already in flight.
+    """
+    from backend import scheduler as _sched
+    dry_run = bool(body.get("dry_run", False))
+    res = _sched.trigger_email_digest_now(dry_run=dry_run)
+    if not res.get("started"):
+        raise HTTPException(status_code=409, detail=res)
+    return res
+
+
+@app.get("/api/notifier/status")
+def notifier_status() -> dict[str, Any]:
+    """Status of the most recent email-digest send, including per-dossier
+    summaries and any error message."""
+    from backend import scheduler as _sched
+    return _sched.get_last_digest_run()
+
+
 def _dedupe_by_id(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Defense-in-depth: drop rows that share an id. Order-preserving."""
     seen: set[str] = set()

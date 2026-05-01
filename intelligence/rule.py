@@ -58,6 +58,17 @@ class AlertRule:
     sort_by: str = "score"                  # one of KNOWN_SORT_KEYS
     limit: int = 100
 
+    # Email digest config (M12-email). When `notify_email` is None or
+    # `notify_enabled` is False, the scheduler's digest job is a no-op.
+    notify_email: str | None = None
+    notify_enabled: bool = True
+    notify_daily_cap: int = 5                       # max dossiers per email
+    notify_min_score: float = 7.0                   # convergence-event score floor
+    notify_min_confidence: float = 0.90             # classifier confidence floor
+    notify_classifications: list[str] = field(
+        default_factory=lambda: ["founder"]
+    )
+
     # --- Validation ----------------------------------------------------
 
     def validate(self) -> list[str]:
@@ -86,6 +97,20 @@ class AlertRule:
             errs.append("prominence_min_stars must be >= 0")
         if self.prominence_max_stars_cap < self.prominence_min_stars:
             errs.append("prominence_max_stars_cap must be >= prominence_min_stars")
+        # Email digest validation
+        if self.notify_email is not None:
+            email = (self.notify_email or "").strip()
+            if email and ("@" not in email or "." not in email or " " in email):
+                errs.append(f"notify_email {email!r} is not a valid email format")
+        if self.notify_daily_cap < 0:
+            errs.append("notify_daily_cap must be >= 0")
+        if not (0.0 <= self.notify_min_confidence <= 1.0):
+            errs.append("notify_min_confidence must be in [0, 1]")
+        if self.notify_min_score < 0:
+            errs.append("notify_min_score must be >= 0")
+        for c in self.notify_classifications:
+            if c not in ("founder", "investor", "operator", "unclear", "not_relevant"):
+                errs.append(f"unknown notify_classification {c!r}")
         return errs
 
     def to_dict(self) -> dict[str, Any]:
