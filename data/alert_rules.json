@@ -1,0 +1,18 @@
+{
+  "demo": {
+    "exclude_active_watchers": true,
+    "limit": 100,
+    "min_distinct_watchers": 2,
+    "min_score": 0.0,
+    "role_tag_filter": [],
+    "signal_types": [
+      "FOLLOWS_ON_GITHUB",
+      "STARRED_REPO"
+    ],
+    "sort_by": "score",
+    "weight_distinct_members": 1.0,
+    "weight_member_quality": 0.0,
+    "weight_recency": 1.0,
+    "window_days": 1100
+  }
+}

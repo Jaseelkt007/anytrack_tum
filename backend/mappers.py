@@ -8,6 +8,7 @@ existing TS types without an adapter layer.
 from __future__ import annotations
 
 import hashlib
+import json as _json
 from typing import Any, Optional
 
 # investor_type (from CSV / Neo4j) → frontend tier
@@ -102,7 +103,7 @@ def map_founder(row: dict[str, Any]) -> dict[str, Any]:
 def _founder_headline(row: dict[str, Any]) -> str:
     n = row.get("watcher_count")
     if n:
-        return f"Followed by {n} watchlist members on GitHub"
+        return f"Convergence: {n} watchlist members signaled on GitHub"
     return "GitHub-active founder candidate"
 
 
@@ -143,11 +144,19 @@ def map_signal(*, founder_id: str, founder_handle: Optional[str], signal: dict[s
 
 # --- ConvergenceAlert mapper ------------------------------------------------
 
-def map_alert(row: dict[str, Any], *, window_days: int = 90) -> dict[str, Any]:
+def map_alert(row: dict[str, Any], *, window_days: int = 90, rank: Optional[int] = None) -> dict[str, Any]:
+    """Map a ConvergenceEvent row + decoded evidence_json into a frontend ConvergenceAlert.
+
+    Returns the legacy ConvergenceAlert shape (for backwards compatibility with
+    the original Lovable types) PLUS a `meta` object with the new fields:
+    score, scoreBreakdown, rank, firstSignalAt, lastSignalAt, signalTypeCounts,
+    windowStart, windowEnd. Frontends can adopt these incrementally.
+    """
+    import json
     founder = {
         "id":             row["founder_id"],
         "name":           row["founder_name"],
-        "headline":       f"Followed by {row['distinct_watchers']} watchlist members on GitHub",
+        "headline":       f"Convergence: {row['distinct_watchers']} watchlist members signaled",
         "location":       "Unknown",
         "company":        None,
         "companyUrl":     None,
@@ -157,15 +166,28 @@ def map_alert(row: dict[str, Any], *, window_days: int = 90) -> dict[str, Any]:
         "initials":       initials_of(row["founder_name"]),
         "avatarColor":    avatar_color_for(row["founder_id"]),
     }
-    signals = [
-        map_signal(
+
+    evidence = _safe_json(row.get("evidence_json"), default=[])
+    breakdown = _safe_json(row.get("score_breakdown_json"), default={})
+    type_counts = _safe_json(row.get("signal_type_counts_json"), default={})
+
+    signals = []
+    for ev in evidence:
+        signal_type = ev.get("signal_type") or "FOLLOWS_ON_GITHUB"
+        signals.append(map_signal(
             founder_id=row["founder_id"],
             founder_handle=row.get("github_handle"),
-            signal=s,
-        )
-        for s in (row.get("signals") or [])
-    ]
-    triggered = max((s["occurredAt"] for s in signals if s["occurredAt"]), default=None) or _now_iso()
+            signal={
+                "edge_type":      signal_type,
+                "watcher_id":     ev.get("watcher_id"),
+                "watcher_name":   ev.get("watcher_name"),
+                "first_seen_at":  ev.get("edge_at"),
+                "repo_full_name": ev.get("repo_full_name"),
+                "repo_html_url":  ev.get("repo_url"),
+            },
+        ))
+
+    triggered = _iso(row.get("fired_at")) or max((s["occurredAt"] for s in signals if s["occurredAt"]), default=None) or _now_iso()
 
     return {
         "id":          f"alert-{row['founder_id'][:8]}",
@@ -173,7 +195,31 @@ def map_alert(row: dict[str, Any], *, window_days: int = 90) -> dict[str, Any]:
         "signals":     signals,
         "windowDays":  window_days,
         "triggeredAt": triggered,
+        # New rich fields — frontends can adopt incrementally.
+        "meta": {
+            "score":            float(row.get("score") or 0.0),
+            "scoreBreakdown":   breakdown,
+            "rank":             rank,
+            "distinctMembers":  int(row.get("distinct_watchers") or 0),
+            "firstSignalAt":    _iso(row.get("first_signal_at")),
+            "lastSignalAt":     _iso(row.get("last_signal_at")),
+            "signalTypeCounts": type_counts,
+            "windowStart":      _iso(row.get("window_start")),
+            "windowEnd":        _iso(row.get("window_end")),
+        },
     }
+
+
+def _safe_json(value: Any, *, default: Any) -> Any:
+    import json
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        return value
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return default
 
 
 # --- Helpers ----------------------------------------------------------------

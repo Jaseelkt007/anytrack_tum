@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from neo4j import GraphDatabase, Driver
 from neo4j.exceptions import ServiceUnavailable
@@ -42,6 +42,8 @@ from backend.mappers import (
     title_for,
     group_for,
 )
+from intelligence import convergence as conv
+from intelligence.rule import AlertRule, get_rule, save_rule, update_rule_partial, KNOWN_SIGNAL_TYPES, KNOWN_SORT_KEYS
 
 ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(ROOT / ".env")
@@ -136,14 +138,66 @@ def list_founders() -> list[dict[str, Any]]:
 
 @app.get("/api/alerts")
 def list_alerts() -> list[dict[str, Any]]:
+    rule = get_rule(DEMO_USER_ID)
     with _session() as s:
         rows = list(s.run(
             queries.LIST_CONVERGENCE_SIGNALS,
             user_id=DEMO_USER_ID,
-            min_watchers=MIN_WATCHERS,
-            limit=FOUNDER_LIMIT,
+            min_watchers=rule.min_distinct_watchers,
+            limit=rule.limit,
         ))
-    return [map_alert(dict(r)) for r in rows]
+    out: list[dict[str, Any]] = []
+    for i, r in enumerate(rows, start=1):
+        out.append(map_alert(dict(r), window_days=rule.window_days, rank=i))
+    return out
+
+
+@app.get("/api/alert-rule")
+def get_alert_rule() -> dict[str, Any]:
+    """Return the current alert rule for the demo user, plus the allowed
+    enum values so the frontend knows what choices to render."""
+    rule = get_rule(DEMO_USER_ID)
+    return {
+        "userId": DEMO_USER_ID,
+        "rule": rule.to_dict(),
+        "allowed": {
+            "signal_types": list(KNOWN_SIGNAL_TYPES),
+            "sort_by":      list(KNOWN_SORT_KEYS),
+        },
+    }
+
+
+@app.put("/api/alert-rule")
+def update_alert_rule(patch: dict[str, Any] = Body(...)) -> dict[str, Any]:
+    """Partial-update of the alert rule. Validates and persists. Returns the
+    new full rule. Does NOT auto-recompute — call POST /api/alerts/recompute.
+    """
+    try:
+        new = update_rule_partial(DEMO_USER_ID, patch)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"userId": DEMO_USER_ID, "rule": new.to_dict()}
+
+
+@app.post("/api/alerts/recompute")
+def recompute_alerts() -> dict[str, Any]:
+    """Re-run the convergence detector with the current rule and persist events.
+
+    Synchronous — returns when done, with a summary. Cheap on Phase 1 data.
+    """
+    if Neo4jState.driver is None:
+        raise HTTPException(status_code=503, detail="Neo4j driver not ready")
+    rule = get_rule(DEMO_USER_ID)
+    events = conv.find_convergences(Neo4jState.driver, user_id=DEMO_USER_ID, rule=rule)
+    end_iso = events[0].window_end if events else (datetime.now(timezone.utc).isoformat())
+    conv.persist_events(Neo4jState.driver, events, user_id=DEMO_USER_ID, window_end_iso=end_iso)
+    return {
+        "userId":     DEMO_USER_ID,
+        "rule":       rule.to_dict(),
+        "fired":      len(events),
+        "topTargets": [{"name": e.target_name, "score": e.score, "n": e.distinct_member_count} for e in events[:5]],
+        "generatedAt": _now_iso(),
+    }
 
 
 @app.get("/api/graph")

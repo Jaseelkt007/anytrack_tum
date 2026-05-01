@@ -37,23 +37,23 @@ ORDER BY p.display_name
 # not themselves an active watcher.
 
 LIST_FOUNDER_CANDIDATES = """
-MATCH (w:Person)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
-MATCH (w)-[:FOLLOWS_ON_GITHUB]->(target:Person)
-WHERE NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
-WITH target, count(DISTINCT w) AS watcher_count
-WHERE watcher_count >= $min_watchers
+// Read from persisted ConvergenceEvent nodes (populated by intelligence.convergence).
+// Falls back to live query if no events are persisted yet.
+MATCH (c:ConvergenceEvent {user_id: $user_id})-[:ABOUT]->(target:Person)
+WHERE c.distinct_member_count >= $min_watchers
 OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
 OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(li:PlatformIdentity {platform: 'linkedin'})
 OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(tw:PlatformIdentity {platform: 'twitter'})
 RETURN
-  target.canonical_id AS id,
-  target.display_name AS name,
-  watcher_count       AS watcher_count,
-  gh.handle           AS github_handle,
-  gh.profile_url      AS github_url,
-  li.profile_url      AS linkedin_url,
-  tw.handle           AS twitter_handle
-ORDER BY watcher_count DESC, target.display_name
+  target.canonical_id        AS id,
+  target.display_name        AS name,
+  c.distinct_member_count    AS watcher_count,
+  c.score                    AS score,
+  gh.handle                  AS github_handle,
+  gh.profile_url             AS github_url,
+  li.profile_url             AS linkedin_url,
+  tw.handle                  AS twitter_handle
+ORDER BY c.score DESC, watcher_count DESC, target.display_name
 LIMIT $limit
 """
 
@@ -63,30 +63,26 @@ LIMIT $limit
 # can group them into ConvergenceAlert objects.
 
 LIST_CONVERGENCE_SIGNALS = """
-MATCH (w:Person)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
-MATCH (w)-[edge:FOLLOWS_ON_GITHUB]->(target:Person)
-WHERE NOT (target)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
-WITH target, w, edge
-ORDER BY edge.first_seen_at DESC
-WITH target,
-     collect({
-       watcher_id:    w.canonical_id,
-       watcher_name:  w.display_name,
-       edge_type:     'FOLLOWS_ON_GITHUB',
-       first_seen_at: edge.first_seen_at,
-       last_seen_at:  edge.last_seen_at
-     }) AS signals,
-     count(DISTINCT w) AS distinct_watchers
-WHERE distinct_watchers >= $min_watchers
+// Read from persisted ConvergenceEvent nodes; signals come from evidence_json.
+MATCH (c:ConvergenceEvent {user_id: $user_id})-[:ABOUT]->(target:Person)
+WHERE c.distinct_member_count >= $min_watchers
 OPTIONAL MATCH (target)-[:HAS_IDENTITY]->(gh:PlatformIdentity {platform: 'github'})
 RETURN
-  target.canonical_id AS founder_id,
-  target.display_name AS founder_name,
-  gh.handle           AS github_handle,
-  gh.profile_url      AS github_url,
-  signals             AS signals,
-  distinct_watchers   AS distinct_watchers
-ORDER BY distinct_watchers DESC, founder_name
+  target.canonical_id        AS founder_id,
+  target.display_name        AS founder_name,
+  gh.handle                  AS github_handle,
+  gh.profile_url             AS github_url,
+  c.evidence_json            AS evidence_json,
+  c.distinct_member_count    AS distinct_watchers,
+  c.score                    AS score,
+  c.score_breakdown_json     AS score_breakdown_json,
+  c.signal_type_counts_json  AS signal_type_counts_json,
+  c.first_signal_at          AS first_signal_at,
+  c.last_signal_at           AS last_signal_at,
+  c.window_start             AS window_start,
+  c.window_end               AS window_end,
+  c.fired_at                 AS fired_at
+ORDER BY c.score DESC, founder_name
 LIMIT $limit
 """
 

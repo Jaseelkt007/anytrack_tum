@@ -120,7 +120,8 @@ def ingest_follows(session, client: GitHubClient, watcher: dict, now_iso: str,
 
 
 def run(user_id: str, limit: int | None, max_pages: int | None,
-        skip_stars: bool, skip_follows: bool) -> int:
+        skip_stars: bool, skip_follows: bool,
+        only_handles: set[str] | None = None) -> int:
     try:
         from dotenv import load_dotenv
         from neo4j import GraphDatabase
@@ -154,6 +155,8 @@ def run(user_id: str, limit: int | None, max_pages: int | None,
             print("      Run scripts/promote_active_watchlist.py first.", file=sys.stderr)
             return 1
 
+        if only_handles:
+            members = [m for m in members if (m.get("github_handle") or "").lower() in only_handles]
         if limit:
             members = members[:limit]
 
@@ -187,6 +190,8 @@ def main() -> int:
     parser.add_argument("--user-id", default="demo")
     parser.add_argument("--limit", type=int, default=None,
                         help="cap number of watchlist members processed")
+    parser.add_argument("--only-handles", type=str, default=None,
+                        help="comma-separated github handles to restrict to")
     parser.add_argument("--max-pages", type=int, default=None,
                         help="cap pages per fetch (useful for fast iteration)")
     parser.add_argument("--skip-stars", action="store_true")
@@ -198,7 +203,10 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
-    return run(args.user_id, args.limit, args.max_pages, args.skip_stars, args.skip_follows)
+    only = None
+    if args.only_handles:
+        only = {h.strip().lower() for h in args.only_handles.split(",") if h.strip()}
+    return run(args.user_id, args.limit, args.max_pages, args.skip_stars, args.skip_follows, only_handles=only)
 
 
 if __name__ == "__main__":
