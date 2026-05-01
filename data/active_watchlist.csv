@@ -1,0 +1,29 @@
+display_name,github_handle,archetype,source,rationale
+Guillermo Rauch,rauchg,angel_operator,augmentation,Vercel CEO; very active angel; 882 follows on GH
+Soumith Chintala,soumith,angel_operator,augmentation,PyTorch creator; ML-focused; 419 follows
+Addy Osmani,addyosmani,angel_operator,augmentation,Google Chrome team; web perf; 266 follows
+Mitchell Hashimoto,mitchellh,angel_operator,augmentation,HashiCorp founder; Ghostty
+Salvatore Sanfilippo,antirez,angel_operator,augmentation,Redis creator
+John Resig,jeresig,angel_operator,augmentation,jQuery creator
+Andrej Karpathy,karpathy,angel_operator,augmentation,Ex-OpenAI/Tesla; ML educator
+Balaji Srinivasan,balajis,angel,augmentation,Prolific tech angel
+Greg Brockman,gdb,angel_operator,augmentation,OpenAI cofounder
+Ben Johnson,benbjohnson,angel_operator,augmentation,Litestream/SQLite tooling
+Nick Sweeting,pirate,angel_operator,augmentation,Active OSS maintainer; 966 follows
+Kenneth Reitz,kennethreitz,angel_operator,augmentation,requests/Pipenv creator; angel
+Jake Wharton,jakewharton,angel_operator,augmentation,Square / Android
+Sindre Sorhus,sindresorhus,angel_operator,augmentation,Prolific OSS maintainer; 1134 repos
+Brad Fitzpatrick,bradfitz,angel_operator,augmentation,Memcached/Go/Tailscale
+Evan Wallace,evanw,angel_operator,augmentation,esbuild / Figma cofounder
+Jared Palmer,jaredpalmer,angel_operator,augmentation,Vercel; Formik; 500 follows
+Lee Robinson,leerob,angel_operator,augmentation,Vercel DevRel; influential in JS world
+TJ Holowaychuk,tj,angel_operator,augmentation,Express/koa creator; Apex
+Isaac Schlueter,isaacs,angel_operator,augmentation,NPM creator
+Scott Chacon,schacon,angel_operator,augmentation,GitHub cofounder
+Tom Preston-Werner,mojombo,angel_operator,augmentation,GitHub cofounder; Jekyll
+Chris Wanstrath,defunkt,angel_operator,augmentation,GitHub cofounder; 215 follows
+Aaron Parecki,aaronpk,angel_operator,augmentation,IndieAuth / OAuth standards
+Christopher Chedeau,vjeux,angel_operator,augmentation,Prettier; React Native; Meta
+Felix Geisendörfer,felixge,angel_operator,augmentation,Node.js core; Datadog
+Max Stoiber,mxstbr,angel_operator,augmentation,styled-components; GitHub; 204 follows
+Peter Bengtsson,peterbe,angel_operator,augmentation,Mozilla; web dev

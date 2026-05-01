@@ -1,0 +1,55 @@
+# --- Secrets ---
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.eggs/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Node / Next.js ---
+node_modules/
+.next/
+out/
+.turbo/
+dist/
+build/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# --- Phase 1 working data ---
+# Never commit scraper output, dump files, or local fixtures derived from APIs.
+data/raw/
+data/cache/
+data/dumps/
+*.dump
+*.cypher.bak
+
+# --- Cleaned investor CSV is regeneratable from the source CSV; don't commit ---
+data/investors_clean.csv
