@@ -73,6 +73,41 @@ class AlertRule:
         default_factory=lambda: ["founder"]
     )
 
+    # --- v2 scoring tunables (sub-project #3) -------------------------------
+    # Archetype → multiplier. Watchers with no archetype default to 1.0.
+    # Per-watcher `watchlist_member.weight` overrides this if set.
+    archetype_weights: dict[str, float] = field(default_factory=lambda: {
+        "angel_operator":   3.0,
+        "founder_investor": 2.5,
+        "vc_partner":       2.0,
+        "operator":         1.5,
+        "vc_associate":     1.0,
+    })
+
+    # Per-(source, action) exponential half-life in days. Each signal's age
+    # is mapped to weight = 0.5 ** (age_days / half_life). Keys take the form
+    # "<source>_<action_type>"; missing keys fall back to default_half_life_days.
+    source_half_lives_days: dict[str, float] = field(default_factory=lambda: {
+        "github_follow":   30.0,
+        "github_star":     14.0,
+        "twitter_follow":  14.0,
+        "linkedin_follow": 30.0,
+    })
+    default_half_life_days: float = 30.0
+
+    # Bayesian smoothing for per-watcher base-rate calibration.
+    # surprise = log(1 + (population_size + alpha) /
+    #                    (watcher_outbound_count + beta))
+    # Smaller beta → high-volume watchers get penalised harder.
+    watcher_base_rate_alpha: float = 1.0
+    watcher_base_rate_beta:  float = 50.0
+    population_size:         int   = 100_000  # rough world-of-targets denominator
+
+    # Independence: signals on the same target by the same source within
+    # this window collapse to one contribution (max-weight, not sum).
+    # 0 = independence check disabled.
+    independence_window_minutes: int = 60
+
     # --- Validation ----------------------------------------------------
 
     def validate(self) -> list[str]:
@@ -101,6 +136,21 @@ class AlertRule:
             errs.append("prominence_min_stars must be >= 0")
         if self.prominence_max_stars_cap < self.prominence_min_stars:
             errs.append("prominence_max_stars_cap must be >= prominence_min_stars")
+        # v2 scoring validation
+        for arch, w in (self.archetype_weights or {}).items():
+            if w < 0:
+                errs.append(f"archetype_weights[{arch!r}] must be >= 0")
+        for k, v in (self.source_half_lives_days or {}).items():
+            if v <= 0:
+                errs.append(f"source_half_lives_days[{k!r}] must be > 0")
+        if self.default_half_life_days <= 0:
+            errs.append("default_half_life_days must be > 0")
+        if self.watcher_base_rate_alpha < 0 or self.watcher_base_rate_beta <= 0:
+            errs.append("watcher_base_rate_alpha must be >= 0 and beta > 0")
+        if self.population_size <= 0:
+            errs.append("population_size must be > 0")
+        if self.independence_window_minutes < 0:
+            errs.append("independence_window_minutes must be >= 0")
         # Email digest validation
         if self.notify_email is not None:
             email = (self.notify_email or "").strip()
