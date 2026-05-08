@@ -1,19 +1,16 @@
 """Project-level pytest config — load .env before any test imports."""
-import asyncio
-
-import pytest
+import pytest_asyncio
 from dotenv import load_dotenv
 
 load_dotenv()
 
 
-@pytest.fixture(autouse=True)
-def _dispose_db_engine_after_test():
-    """Tear down any global async engine the test created.
-
-    Without this, an open asyncpg pool collides with pytest-asyncio's
-    event-loop teardown — surfacing as `RuntimeError: Event loop is closed`
-    while asyncpg tries to cancel a stranded connection.
+@pytest_asyncio.fixture(autouse=True, loop_scope="function")
+async def _dispose_db_engine_after_test():
+    """Tear down any global async engine the test created, *inside* the
+    test's event loop. Required because asyncpg connections are bound to
+    the loop that created them; closing them on a different loop produces
+    `RuntimeError: Event loop is closed` at teardown.
     """
     yield
     try:
@@ -23,8 +20,6 @@ def _dispose_db_engine_after_test():
     if engine_mod._engine is None:
         return
     try:
-        loop = asyncio.new_event_loop()
-        loop.run_until_complete(engine_mod.dispose_engine())
-        loop.close()
-    except RuntimeError:
+        await engine_mod.dispose_engine()
+    except Exception:
         pass

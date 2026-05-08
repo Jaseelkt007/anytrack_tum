@@ -50,8 +50,8 @@ _LIST_ELIGIBLE_SQL = text("""
     FROM proxy
     WHERE health = 'healthy'
       AND (cooldown_until IS NULL OR cooldown_until < now())
-      AND (:kind IS NULL OR kind = :kind)
-      AND (:geo  IS NULL OR geo  = :geo)
+      AND (CAST(:kind AS text) IS NULL OR kind = :kind)
+      AND (CAST(:geo  AS text) IS NULL OR geo  = :geo)
     ORDER BY last_used_at NULLS FIRST, id
 """)
 
