@@ -17,5 +17,41 @@ services:
       timeout: 3s
       retries: 20
 
+  # --- Opt-in services (use --profile <name> to start) -----------------
+  # Local dev usually runs api and worker natively (`uvicorn ...` and
+  # `python -m worker`) for fast iteration. The container variants exist
+  # so the topology mirrors prod (Fly.io machines) when you want it.
+  api:
+    profiles: ["api"]
+    build: .
+    image: anytrace-api
+    command: ["uvicorn", "backend.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://anytrace:anytrace@postgres:5432/anytrace
+      DATABASE_URL_DIRECT: postgresql+psycopg://anytrace:anytrace@postgres:5432/anytrace
+      PIPELINE_SCHEDULER_ENABLED: "0"
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  worker:
+    profiles: ["worker"]
+    build: .
+    image: anytrace-worker
+    command: ["python", "-m", "worker"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://anytrace:anytrace@postgres:5432/anytrace
+      DATABASE_URL_DIRECT: postgresql+psycopg://anytrace:anytrace@postgres:5432/anytrace
+      GITHUB_TOKEN: ${GITHUB_TOKEN:-}
+      GITHUB_TOKEN_2: ${GITHUB_TOKEN_2:-}
+      GITHUB_TOKEN_3: ${GITHUB_TOKEN_3:-}
+      GITHUB_TOKEN_4: ${GITHUB_TOKEN_4:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data: {}
