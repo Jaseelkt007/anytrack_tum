@@ -17,7 +17,30 @@
       "Bash(curl -s http://127.0.0.1:8000/api/alerts)",
       "Bash(python scripts/backfill_identity_resolver.py --no-llm)",
       "Bash(/mnt/d/tum_ai/.venv/bin/python *)",
-      "Bash(/mnt/d/tum_ai/.venv/bin/pip install *)"
+      "Bash(/mnt/d/tum_ai/.venv/bin/pip install *)",
+      "Bash(python *)",
+      "Bash(PIPELINE_SCHEDULER_DISABLED=1 /mnt/d/tum_ai/.venv/bin/uvicorn backend.app:app *)",
+      "Bash(curl -s http://127.0.0.1:8768/api/health)",
+      "Bash(curl -i -s -X OPTIONS -H 'Origin: https://example.lovableproject.com' -H 'Access-Control-Request-Method: PUT' -H 'Access-Control-Request-Headers: content-type,ngrok-skip-browser-warning' http://127.0.0.1:8768/api/alert-rule)",
+      "Bash(curl -i -s -X PUT -H 'Origin: https://example.lovableproject.com' -H 'Content-Type: application/json' -d '{\"notify_email\":\"test@example.com\"}' http://127.0.0.1:8768/api/alert-rule)",
+      "Bash(curl -i -s -X OPTIONS -H 'Origin: https://example.lovableproject.com' -H 'Access-Control-Request-Method: POST' -H 'Access-Control-Request-Headers: content-type' http://127.0.0.1:8768/api/notifier/send-now)",
+      "Bash(pkill -f \"uvicorn backend.app:app --host 127.0.0.1 --port 8768\")",
+      "Bash(.venv/bin/python *)",
+      "Bash(curl -s http://127.0.0.1:8000/api/graph)",
+      "Bash(/mnt/d/tum_ai/.venv/bin/pip3 install *)",
+      "Bash(/mnt/d/tum_ai/.venv/bin/pip3 uninstall *)",
+      "Bash(docker compose *)",
+      "Bash(git commit *)",
+      "Bash(.venv/bin/alembic revision *)",
+      "Bash(.venv/bin/alembic upgrade *)",
+      "Bash(PGPASSWORD=anytrace psql *)",
+      "Bash(docker exec anytrace-postgres *)",
+      "Bash(PATH=/mnt/d/tum_ai/.venv/bin:__TRACKED_VAR__ .venv/bin/pytest tests/db/test_migration.py -v)",
+      "Bash(.venv/bin/pytest tests/db/test_migration.py -v)",
+      "Bash(.venv/bin/pytest tests/db/test_bootstrap.py -v)",
+      "Bash(.venv/bin/pytest tests/queries/test_convergence_parity.py -v)",
+      "Bash(.venv/bin/pytest tests/ -v --no-header)",
+      "Bash(.venv/bin/pytest tests/ -q)"
     ]
   }
 }
