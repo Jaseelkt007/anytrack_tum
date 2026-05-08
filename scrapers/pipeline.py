@@ -1,8 +1,8 @@
 """GitHub ingestion pipeline orchestrator.
 
-Reads tier='active' watchlist members from Neo4j (each must have a github
-PlatformIdentity), fetches their stars and follows from GitHub, writes
-append-only edges into Neo4j.
+Reads tier='active' watchlist members from Postgres (each must have a github
+platform_identity), fetches their stars and follows from GitHub, writes
+append-only events into edge_event.
 
 Usage:
     python -m scrapers.pipeline                       # full sweep, default user 'demo'
@@ -15,21 +15,30 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parent.parent
+from sqlalchemy.ext.asyncio import AsyncSession
 
-# Ensure project root is importable when run as `python -m scrapers.pipeline` from /
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from scrapers import cypher
+from db.engine import dispose_engine, session_scope
 from scrapers.github_client import GitHubClient
 from scrapers.jobs.fetch_following import fetch_following
 from scrapers.jobs.fetch_starred_repos import fetch_starred
+from scrapers.persistence import (
+    fetch_active_watchlist_with_github,
+    gh_person_id,
+    link_repo_owner,
+    record_edge_event,
+    upsert_person_by_github,
+    upsert_repository,
+)
 
 logger = logging.getLogger("scrapers.pipeline")
 
@@ -47,21 +56,16 @@ def _gather_tokens() -> list[str]:
     return tokens
 
 
-def fetch_active_watchlist(session, user_id: str) -> list[dict]:
-    result = session.run(cypher.QUERY_ACTIVE_WATCHLIST_WITH_GITHUB, user_id=user_id)
-    return [dict(r) for r in result]
-
-
-def ingest_stars(session, client: GitHubClient, watcher: dict, now_iso: str,
-                 max_pages: int | None) -> tuple[int, int]:
+async def ingest_stars(session: AsyncSession, client: GitHubClient,
+                        watcher: dict, *, org_id: str,
+                        max_pages: int | None) -> tuple[int, int]:
     """Returns (repos_observed, stars_observed)."""
     handle = watcher["github_handle"]
     repos = 0
     stars = 0
     for event in fetch_starred(client, handle, max_pages=max_pages):
-        # Repository upsert
-        session.run(
-            cypher.UPSERT_REPOSITORY,
+        await upsert_repository(
+            session,
             github_id=str(event.repo_github_id),
             owner_handle=event.repo_owner,
             name=event.repo_name,
@@ -70,155 +74,109 @@ def ingest_stars(session, client: GitHubClient, watcher: dict, now_iso: str,
             language=event.repo_language,
             star_count=event.repo_star_count,
             html_url=event.repo_html_url,
-            now_iso=now_iso,
         )
         repos += 1
-        # Watcher --STARRED_REPO--> Repository (with historical starred_at)
-        session.run(
-            cypher.MERGE_STARRED_REPO,
-            watcher_id=watcher["canonical_id"],
-            repo_github_id=str(event.repo_github_id),
-            starred_at=event.starred_at,
-            now_iso=now_iso,
+
+        await record_edge_event(
+            session,
+            org_id=org_id,
+            source="github",
+            action_type="star",
+            watcher_person_id=watcher["canonical_id"],
+            target_kind="repository",
+            target_repo_id=str(event.repo_github_id),
+            observed_at=event.starred_at if isinstance(event.starred_at, datetime)
+                else _parse_iso_or_now(event.starred_at),
+            evidence_url=event.repo_html_url,
         )
         stars += 1
-        # Opportunistic: if the repo owner is a known Person via github identity,
-        # tag OWNS_REPO. Cheap — runs once per star.
-        session.run(
-            cypher.MERGE_OWNS_REPO,
-            owner_handle=event.repo_owner,
+
+        # Opportunistic: link the owner if they're/become a known Person.
+        await link_repo_owner(
+            session,
+            org_id=org_id,
             repo_github_id=str(event.repo_github_id),
-            now_iso=now_iso,
+            owner_handle=event.repo_owner,
         )
     return repos, stars
 
 
-def ingest_follows(session, client: GitHubClient, watcher: dict, now_iso: str,
-                   max_pages: int | None) -> int:
+async def ingest_follows(session: AsyncSession, client: GitHubClient,
+                          watcher: dict, *, org_id: str,
+                          max_pages: int | None) -> int:
     handle = watcher["github_handle"]
     follows = 0
     skipped_non_user = 0
+    now = datetime.now(timezone.utc)
     for entry in fetch_following(client, handle, max_pages=max_pages):
-        # Orgs / bots are noise, not founder candidates. Skip them at the boundary
-        # so they never enter the Person space.
         if entry.type != "User":
             skipped_non_user += 1
             continue
-        followed_id = cypher.github_person_id(entry.handle)
-        session.run(
-            cypher.UPSERT_PERSON_BY_GITHUB,
-            canonical_id=followed_id,
+
+        followed_id = await upsert_person_by_github(
+            session,
+            org_id=org_id,
             handle=entry.handle,
-            profile_url=entry.profile_url,
             display_name=entry.handle,  # bare handle until enriched
+            profile_url=entry.profile_url,
             kind=entry.type,
-            now_iso=now_iso,
         )
-        session.run(
-            cypher.MERGE_FOLLOWS_GITHUB,
-            watcher_id=watcher["canonical_id"],
-            followed_id=followed_id,
-            now_iso=now_iso,
+
+        await record_edge_event(
+            session,
+            org_id=org_id,
+            source="github",
+            action_type="follow",
+            watcher_person_id=watcher["canonical_id"],
+            target_kind="person",
+            target_person_id=followed_id,
+            observed_at=now,
+            evidence_url=entry.profile_url,
         )
         follows += 1
+
     if skipped_non_user:
         logger.info("skipped %d non-User follows for %s", skipped_non_user, handle)
     return follows
 
 
-def _run_twitter_stage(driver, user_id: str, max_pages: int) -> tuple[int, int]:
-    """Run the Scrapebadger ingest for tier='active' + reference-angel twitter handles,
-    then load any new signals into Neo4j. Returns (signals_emitted, edges_upserted).
-
-    Designed to be cheap on second runs (idempotent); first run baselines snapshots.
-    """
-    import subprocess
-    from scrapers.jobs.load_twitter_signals_to_neo4j import load_signals
-
-    watchlist_path = ROOT / "data" / "twitter_vc_watchlist.txt"
-    targets_path = ROOT / "data" / "twitter_interesting_people.txt"
-    snapshot_dir = ROOT / "data" / "scrapebadger_twitter_snapshots"
-    signals_path = ROOT / "data" / "scrapebadger_twitter_follow_signals.jsonl"
-
-    if not watchlist_path.exists():
-        print(f"WARN: {watchlist_path} not found — skipping twitter stage. "
-              "Run scripts/build_twitter_watchlist.py first.", file=sys.stderr)
-        return 0, 0
-
-    cli = [
-        sys.executable,
-        str(ROOT / "scripts" / "track_scrapebadger_twitter_follows.py"),
-        "--watchlist", str(watchlist_path),
-        "--snapshot-dir", str(snapshot_dir),
-        "--signals-file", str(signals_path),
-        "--max-pages", str(max_pages),
-    ]
-    if targets_path.exists():
-        cli += ["--targets", str(targets_path)]
-    print(f"\n--- Twitter stage (Scrapebadger) ---")
-    proc = subprocess.run(cli, check=False)
-    if proc.returncode != 0:
-        print(f"WARN: twitter ingest CLI exit code {proc.returncode}", file=sys.stderr)
-
-    # Count signals after the run; load any new ones to Neo4j.
-    signals_count = 0
-    if signals_path.exists():
-        with signals_path.open() as f:
-            signals_count = sum(1 for line in f if line.strip())
-
-    edges_upserted = 0
-    with driver.session() as session:
-        load_result = load_signals(session, signals_path)
-    edges_upserted = load_result.edges_upserted
-    print(f"Twitter signals on disk: {signals_count}; edges upserted this run: {edges_upserted}")
-    if load_result.skipped_unknown_watcher:
-        print(f"  ({load_result.skipped_unknown_watcher} signals skipped — "
-              "watcher not yet in graph)")
-    if load_result.target_persons_resolved:
-        print(f"  resolver tier counts: {load_result.target_persons_resolved}")
-    return signals_count, edges_upserted
-
-
-def run(user_id: str, limit: int | None, max_pages: int | None,
-        skip_stars: bool, skip_follows: bool,
-        only_handles: set[str] | None = None,
-        with_twitter: bool = False,
-        twitter_max_pages: int = 1) -> int:
+def _parse_iso_or_now(value) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if not value:
+        return datetime.now(timezone.utc)
     try:
-        from dotenv import load_dotenv
-        from neo4j import GraphDatabase
-    except ImportError as exc:
-        print(f"ERROR: missing dependency ({exc.name}). Run: pip install -r requirements.txt", file=sys.stderr)
-        return 2
+        s = value
+        if isinstance(s, str) and s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        return datetime.fromisoformat(s) if isinstance(s, str) else datetime.now(timezone.utc)
+    except ValueError:
+        return datetime.now(timezone.utc)
 
-    load_dotenv(ROOT / ".env")
+
+async def _async_run(*, user_id: str, org_id: str, limit: int | None,
+                      max_pages: int | None, skip_stars: bool, skip_follows: bool,
+                      only_handles: set[str] | None) -> int:
     tokens = _gather_tokens()
     if not tokens:
         print("ERROR: GITHUB_TOKEN not set in .env", file=sys.stderr)
         return 2
 
-    neo4j_uri = os.environ.get("NEO4J_URI")
-    neo4j_user = os.environ.get("NEO4J_USER")
-    neo4j_pw = os.environ.get("NEO4J_PASSWORD")
-    if not all([neo4j_uri, neo4j_user, neo4j_pw]):
-        print("ERROR: Neo4j env vars missing", file=sys.stderr)
-        return 2
-
     client = GitHubClient(tokens=tokens)
-    driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_pw))
-    now_iso = datetime.now(timezone.utc).isoformat()
 
     total_repos = total_stars = total_follows = 0
 
-    with driver.session() as session:
-        members = fetch_active_watchlist(session, user_id)
+    async with session_scope() as session:
+        members = await fetch_active_watchlist_with_github(session, user_id=user_id)
         if not members:
-            print("WARN: no tier='active' watchlist members with a GitHub identity found.", file=sys.stderr)
-            print("      Run scripts/promote_active_watchlist.py first.", file=sys.stderr)
+            print("WARN: no tier='active' watchlist members with a GitHub identity found.",
+                  file=sys.stderr)
+            print("      Run scripts/bootstrap_demo_data.py first.", file=sys.stderr)
             return 1
 
         if only_handles:
-            members = [m for m in members if (m.get("github_handle") or "").lower() in only_handles]
+            members = [m for m in members
+                       if (m.get("github_handle") or "").lower() in only_handles]
         if limit:
             members = members[:limit]
 
@@ -228,25 +186,26 @@ def run(user_id: str, limit: int | None, max_pages: int | None,
             print(f"[{i}/{len(members)}] {label}")
             try:
                 if not skip_stars:
-                    repos, stars = ingest_stars(session, client, m, now_iso, max_pages)
+                    repos, stars = await ingest_stars(
+                        session, client, m, org_id=org_id, max_pages=max_pages,
+                    )
                     total_repos += repos
                     total_stars += stars
                     print(f"    stars: {stars}")
                 if not skip_follows:
-                    f = ingest_follows(session, client, m, now_iso, max_pages)
+                    f = await ingest_follows(
+                        session, client, m, org_id=org_id, max_pages=max_pages,
+                    )
                     total_follows += f
                     print(f"    follows: {f}")
+                # Commit per-watcher so a partial failure doesn't lose hours of work.
+                await session.commit()
             except Exception as exc:
                 logger.error("failed for %s: %s", label, exc)
+                await session.rollback()
                 continue
 
-    if with_twitter:
-        try:
-            _run_twitter_stage(driver, user_id, twitter_max_pages)
-        except Exception as exc:
-            logger.error("twitter stage failed: %s", exc)
-
-    driver.close()
+    await dispose_engine()
 
     print()
     print(f"Pipeline complete.  repos_upserted={total_repos}  stars={total_stars}  follows={total_follows}")
@@ -256,6 +215,7 @@ def run(user_id: str, limit: int | None, max_pages: int | None,
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--user-id", default="demo")
+    parser.add_argument("--org-id", default="demo")
     parser.add_argument("--limit", type=int, default=None,
                         help="cap number of watchlist members processed")
     parser.add_argument("--only-handles", type=str, default=None,
@@ -264,11 +224,6 @@ def main() -> int:
                         help="cap pages per fetch (useful for fast iteration)")
     parser.add_argument("--skip-stars", action="store_true")
     parser.add_argument("--skip-follows", action="store_true")
-    parser.add_argument("--with-twitter", action="store_true",
-                        help="Also run the Scrapebadger twitter follow tracker (M8).")
-    parser.add_argument("--twitter-max-pages", type=int, default=1,
-                        help="Pages per twitter handle (default 1 per the brief). "
-                             "Baseline depth and diff depth must match.")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -276,16 +231,20 @@ def main() -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+
+    from dotenv import load_dotenv
+    load_dotenv(ROOT / ".env")
+
     only = None
     if args.only_handles:
         only = {h.strip().lower() for h in args.only_handles.split(",") if h.strip()}
-    return run(
-        args.user_id, args.limit, args.max_pages,
-        args.skip_stars, args.skip_follows,
+
+    return asyncio.run(_async_run(
+        user_id=args.user_id, org_id=args.org_id,
+        limit=args.limit, max_pages=args.max_pages,
+        skip_stars=args.skip_stars, skip_follows=args.skip_follows,
         only_handles=only,
-        with_twitter=args.with_twitter,
-        twitter_max_pages=args.twitter_max_pages,
-    )
+    ))
 
 
 if __name__ == "__main__":
