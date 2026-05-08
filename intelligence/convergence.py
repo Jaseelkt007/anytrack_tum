@@ -1,10 +1,12 @@
 """Convergence detection — the core intelligence layer.
 
 A "convergence" fires when ≥ N distinct active watchers have signal edges to the
-same target Person within a sliding time window. Two signal types contribute:
+same target Person within a sliding time window. Three signal types contribute:
 
-  1. FOLLOWS_ON_GITHUB: watcher -> target Person directly
-  2. STARRED_REPO + OWNS_REPO: watcher -> Repository <- target Person (the repo owner)
+  1. FOLLOWS_ON_GITHUB  : watcher --[follow @ github]--> target Person
+  2. STARRED_REPO       : watcher --[star @ github]--> Repository <-- target Person (owner)
+  3. FOLLOWS_ON_TWITTER : watcher --[follow @ twitter]--> target Person
+                          (with confidence threshold; broader watcher pool)
 
 Phase 1 scoring (kept simple — Bayesian + Cox come in Phase 2):
     score = distinct_member_count
@@ -20,13 +22,17 @@ CLI:
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
-import os
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+from sqlalchemy import text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.ext.asyncio import AsyncSession
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -38,7 +44,7 @@ logger = logging.getLogger("intelligence.convergence")
 
 @dataclass
 class ConvergenceEvent:
-    """One convergence signal. Persisted as a ConvergenceEvent node in Neo4j."""
+    """One convergence signal. Persisted as a row in convergence_event."""
 
     target_id: str
     target_name: str
@@ -58,135 +64,137 @@ class ConvergenceEvent:
 
     @property
     def event_id(self) -> str:
-        # Stable id so re-runs MERGE the same event
+        # Stable id so re-runs UPSERT the same event
         return f"cv-{self.user_id}-{self.target_id}-{self.window_end[:10]}"
 
 
-# --- Cypher -----------------------------------------------------------------
-# One unified query: find every (watcher, target) edge of either signal type
-# inside the window, then aggregate per target. The `target` is always a Person.
+# --- SQL CTEs ---------------------------------------------------------------
+# Three UNIONed branches mirror the previous Cypher: github-follow,
+# github-star (via repo owner), and twitter-follow (with confidence + broader
+# watcher pool). Returns flat columns; aggregate() does the per-target rollup.
 
-UNIFIED_CONVERGENCE_QUERY = """
-// FOLLOWS_ON_GITHUB signals
-MATCH (w:Person)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
-MATCH (w)-[edge:FOLLOWS_ON_GITHUB]->(target:Person)
-WHERE edge.first_seen_at >= datetime($window_start)
-  AND edge.first_seen_at <= datetime($window_end)
-  AND NOT EXISTS {
-    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
-    WHERE wx.tier IN ['active', 'vip']
-  }
-  AND coalesce(target.entity_type, 'User') = 'User'
-RETURN target, w, edge.first_seen_at AS edge_at,
-       'FOLLOWS_ON_GITHUB' AS signal_type,
-       NULL AS repo_full_name, NULL AS repo_url,
-       NULL AS evidence_url, NULL AS edge_confidence
+UNIFIED_CONVERGENCE_SQL = text("""
+WITH window_signals AS (
+    -- Branch 1: github follow signals (active watchers only)
+    SELECT
+        ee.target_person_id              AS target_id,
+        tp.display_name                  AS target_name,
+        ee.watcher_person_id             AS watcher_id,
+        wp.display_name                  AS watcher_name,
+        ee.observed_at                   AS edge_at,
+        'FOLLOWS_ON_GITHUB'              AS signal_type,
+        NULL::text                       AS repo_full_name,
+        NULL::text                       AS repo_url,
+        ee.evidence_url                  AS evidence_url,
+        ee.edge_confidence               AS edge_confidence
+    FROM edge_event ee
+    JOIN watchlist_member w
+      ON w.person_id = ee.watcher_person_id
+     AND w.user_id   = :user_id
+     AND w.tier      = 'active'
+    JOIN person tp ON tp.id = ee.target_person_id
+    JOIN person wp ON wp.id = ee.watcher_person_id
+    WHERE ee.target_kind = 'person'
+      AND ee.source      = 'github'
+      AND ee.action_type = 'follow'
+      AND ee.observed_at BETWEEN :window_start AND :window_end
+      AND ee.org_id = :org_id
+      AND COALESCE(tp.entity_type, 'User') = 'User'
+      AND NOT EXISTS (
+          SELECT 1 FROM watchlist_member wx
+          WHERE wx.person_id = ee.target_person_id
+            AND wx.user_id   = :user_id
+            AND wx.tier      IN ('active','vip')
+      )
 
-UNION
+    UNION ALL
 
-// STARRED_REPO signals — watcher stars a repo whose owner is a Person we know
-MATCH (w:Person)-[:WATCHED_BY {tier: 'active'}]->(:User {id: $user_id})
-MATCH (w)-[edge:STARRED_REPO]->(repo:Repository)
-MATCH (target:Person)-[:OWNS_REPO]->(repo)
-WHERE edge.first_seen_at >= datetime($window_start)
-  AND edge.first_seen_at <= datetime($window_end)
-  AND NOT EXISTS {
-    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
-    WHERE wx.tier IN ['active', 'vip']
-  }
-  AND target <> w
-  AND coalesce(target.entity_type, 'User') = 'User'
-RETURN target, w, edge.first_seen_at AS edge_at,
-       'STARRED_REPO' AS signal_type,
-       repo.full_name AS repo_full_name, repo.html_url AS repo_url,
-       repo.html_url AS evidence_url, NULL AS edge_confidence
+    -- Branch 2: github star signals attributed to the repo owner
+    SELECT
+        ro.owner_person_id               AS target_id,
+        tp.display_name                  AS target_name,
+        ee.watcher_person_id             AS watcher_id,
+        wp.display_name                  AS watcher_name,
+        ee.observed_at                   AS edge_at,
+        'STARRED_REPO'                   AS signal_type,
+        r.full_name                      AS repo_full_name,
+        r.html_url                       AS repo_url,
+        r.html_url                       AS evidence_url,
+        ee.edge_confidence               AS edge_confidence
+    FROM edge_event ee
+    JOIN repository r        ON r.github_id = ee.target_repo_id
+    JOIN repository_owner ro ON ro.repo_id  = r.github_id
+    JOIN watchlist_member w
+      ON w.person_id = ee.watcher_person_id
+     AND w.user_id   = :user_id
+     AND w.tier      = 'active'
+    JOIN person tp ON tp.id = ro.owner_person_id
+    JOIN person wp ON wp.id = ee.watcher_person_id
+    WHERE ee.target_kind = 'repository'
+      AND ee.source      = 'github'
+      AND ee.action_type = 'star'
+      AND ee.observed_at BETWEEN :window_start AND :window_end
+      AND ee.org_id = :org_id
+      AND ro.owner_person_id <> ee.watcher_person_id
+      AND COALESCE(tp.entity_type, 'User') = 'User'
+      AND NOT EXISTS (
+          SELECT 1 FROM watchlist_member wx
+          WHERE wx.person_id = ro.owner_person_id
+            AND wx.user_id   = :user_id
+            AND wx.tier      IN ('active','vip')
+      )
 
-UNION
+    UNION ALL
 
-// FOLLOWS_ON_TWITTER signals — observed via Scrapebadger snapshot diffs (M8).
-// edge.first_seen_at is the OBSERVATION time, not a real follow timestamp.
-// edge.confidence: 0.91 for diff signals, 0.76 for baseline-existing.
-//
-// Tier semantics differ here vs. the GitHub branches: M8 polls a broader set
-// (the 76 reference angels with twitter handles + active watchers), not just
-// tier='active'. Any watcher with a WATCHED_BY edge contributes their twitter
-// follows. The active-only restriction stays on the TARGET side — we still
-// don't fire on watcher-to-watcher convergence.
-MATCH (w:Person)-[:WATCHED_BY]->(:User {id: $user_id})
-MATCH (w)-[edge:FOLLOWS_ON_TWITTER]->(target:Person)
-WHERE edge.first_seen_at >= datetime($window_start)
-  AND edge.first_seen_at <= datetime($window_end)
-  AND coalesce(edge.confidence, 1.0) >= $twitter_min_confidence
-  AND NOT EXISTS {
-    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
-    WHERE wx.tier IN ['active', 'vip']
-  }
-  AND coalesce(target.entity_type, 'User') = 'User'
-RETURN target, w, edge.first_seen_at AS edge_at,
-       'FOLLOWS_ON_TWITTER' AS signal_type,
-       NULL AS repo_full_name, NULL AS repo_url,
-       edge.evidence_url AS evidence_url, edge.confidence AS edge_confidence
-"""
-
-# Aggregation runs in Python (more flexible than UNION+aggregate inside Cypher).
-
-# Per-target max owned-repo star count, for the M12.5 GitHub-prominence bonus.
-QUERY_TARGET_PROMINENCE = """
-MATCH (p:Person)
-WHERE p.canonical_id IN $ids
-OPTIONAL MATCH (p)-[:OWNS_REPO]->(r:Repository)
-RETURN p.canonical_id AS id,
-       max(coalesce(r.star_count_observed, 0)) AS max_stars
-"""
-
-
-# --- ConvergenceEvent persistence -------------------------------------------
-
-UPSERT_CONVERGENCE_EVENT = """
-MERGE (c:ConvergenceEvent {id: $id})
-SET
-    c.target_person_id        = $target_id,
-    c.user_id                 = $user_id,
-    c.fired_at                = datetime($fired_at),
-    c.window_start            = datetime($window_start),
-    c.window_end              = datetime($window_end),
-    c.distinct_member_count   = $distinct_member_count,
-    c.member_ids              = $member_ids,
-    c.score                   = $score,
-    c.score_breakdown_json    = $score_breakdown_json,
-    c.first_signal_at         = CASE WHEN $first_signal_at IS NULL THEN NULL ELSE datetime($first_signal_at) END,
-    c.last_signal_at          = CASE WHEN $last_signal_at  IS NULL THEN NULL ELSE datetime($last_signal_at)  END,
-    c.signal_type_counts_json = $signal_type_counts_json,
-    c.evidence_json           = $evidence_json
-WITH c
-MATCH (target:Person {canonical_id: $target_id})
-MERGE (c)-[:ABOUT]->(target)
-"""
-
-DELETE_STALE_CONVERGENCE_EVENTS = """
-// Drop events that no longer reflect reality. Two failure modes addressed:
-//   (a) the target was promoted to tier='active' since the event fired (watchers
-//       can never be founders);
-//   (b) for events of the *current* window_end_date, the target dropped out of
-//       the new candidate set (rule changed, signals expired, etc.).
-// Historical snapshots from previous windows are preserved EXCEPT when (a) holds.
-MATCH (c:ConvergenceEvent {user_id: $user_id})
-OPTIONAL MATCH (target:Person {canonical_id: c.target_person_id})
-WITH c, target
-WHERE
-  // (a) target became a watchlist member ('active' or 'vip') — no longer a valid founder candidate
-  (target IS NOT NULL AND EXISTS {
-    MATCH (target)-[wx:WATCHED_BY]->(:User {id: $user_id})
-    WHERE wx.tier IN ['active', 'vip']
-  })
-  OR
-  // (b) current-window event whose target isn't in the freshly-computed set
-  (c.id ENDS WITH $window_end_date AND NOT c.target_person_id IN $current_target_ids)
-DETACH DELETE c
-"""
+    -- Branch 3: twitter follow signals — all tiered watchers (active/vip/reference)
+    SELECT
+        ee.target_person_id              AS target_id,
+        tp.display_name                  AS target_name,
+        ee.watcher_person_id             AS watcher_id,
+        wp.display_name                  AS watcher_name,
+        ee.observed_at                   AS edge_at,
+        'FOLLOWS_ON_TWITTER'             AS signal_type,
+        NULL::text                       AS repo_full_name,
+        NULL::text                       AS repo_url,
+        ee.evidence_url                  AS evidence_url,
+        ee.edge_confidence               AS edge_confidence
+    FROM edge_event ee
+    JOIN watchlist_member w
+      ON w.person_id = ee.watcher_person_id
+     AND w.user_id   = :user_id
+    JOIN person tp ON tp.id = ee.target_person_id
+    JOIN person wp ON wp.id = ee.watcher_person_id
+    WHERE ee.target_kind = 'person'
+      AND ee.source      = 'twitter'
+      AND ee.action_type = 'follow'
+      AND ee.observed_at BETWEEN :window_start AND :window_end
+      AND ee.org_id = :org_id
+      AND COALESCE(ee.edge_confidence, 1.0) >= :twitter_min_confidence
+      AND COALESCE(tp.entity_type, 'User') = 'User'
+      AND NOT EXISTS (
+          SELECT 1 FROM watchlist_member wx
+          WHERE wx.person_id = ee.target_person_id
+            AND wx.user_id   = :user_id
+            AND wx.tier      IN ('active','vip')
+      )
+)
+SELECT * FROM window_signals
+""")
 
 
-# --- Pure-function scoring (testable without Neo4j) ------------------------
+TARGET_PROMINENCE_SQL = text("""
+SELECT
+    p.id                                       AS id,
+    COALESCE(MAX(r.star_count_observed), 0)    AS max_stars
+FROM person p
+LEFT JOIN repository_owner ro ON ro.owner_person_id = p.id
+LEFT JOIN repository r        ON r.github_id        = ro.repo_id
+WHERE p.id = ANY(:ids)
+GROUP BY p.id
+""")
+
+
+# --- Pure-function scoring (testable without DB) ---------------------------
 
 def compute_target_prominence(max_owned_repo_stars: int,
                               *, min_stars: int = 100,
@@ -250,14 +258,12 @@ def compute_score(distinct_member_count: int,
 
 
 def _parse_iso(s: str) -> datetime:
-    """Parse an ISO-8601 string. Handles trailing 'Z' and Neo4j nanosecond fractions."""
+    """Parse an ISO-8601 string. Handles trailing 'Z' and nanosecond fractions."""
     s = s.strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
-    # Truncate fractional seconds to 6 digits (Python's max)
     if "." in s:
         head, _, tail = s.partition(".")
-        # tail looks like "123456789+00:00" — keep up to 6 fractional digits, then tz
         frac = ""
         rest = tail
         for ch in tail:
@@ -356,7 +362,7 @@ def aggregate(rows: list[dict[str, Any]],
             weight_distinct_members=rule.weight_distinct_members,
             weight_recency=rule.weight_recency,
             weight_member_quality=rule.weight_member_quality,
-            member_quality_value=0.0,    # M11 hook
+            member_quality_value=0.0,
             weight_target_prominence=rule.weight_target_prominence,
             target_prominence_value=prominence_value,
         )
@@ -393,23 +399,20 @@ def aggregate(rows: list[dict[str, Any]],
 def _iso_str(value: Any) -> Optional[str]:
     if value is None:
         return None
-    if hasattr(value, "iso_format"):
-        return value.iso_format()
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return str(value)
 
 
-# --- Live runner ------------------------------------------------------------
+# --- Runner (Postgres) ------------------------------------------------------
 
-def find_convergences(driver, *, user_id: str = "demo",
-                      as_of: Optional[datetime] = None,
-                      rule=None) -> list[ConvergenceEvent]:
-    """Compute ConvergenceEvents from the current Neo4j state.
-
-    `rule` is an intelligence.rule.AlertRule. If None, uses the persisted rule
-    for `user_id` (or DEFAULT_RULE if no rule saved).
-    """
+async def find_convergences(session: AsyncSession,
+                             *,
+                             user_id: str = "demo",
+                             org_id: str = "demo",
+                             as_of: Optional[datetime] = None,
+                             rule=None) -> list[ConvergenceEvent]:
+    """Compute ConvergenceEvents from the current Postgres state."""
     if rule is None:
         from intelligence.rule import get_rule
         rule = get_rule(user_id)
@@ -418,111 +421,140 @@ def find_convergences(driver, *, user_id: str = "demo",
     start = end - timedelta(days=rule.window_days)
     window_start, window_end = start.isoformat(), end.isoformat()
 
-    with driver.session() as session:
-        rows = list(session.run(
-            UNIFIED_CONVERGENCE_QUERY,
-            user_id=user_id,
-            window_start=window_start,
-            window_end=window_end,
-            twitter_min_confidence=rule.twitter_signal_min_confidence,
-        ))
+    result = await session.execute(
+        UNIFIED_CONVERGENCE_SQL,
+        {
+            "org_id": org_id,
+            "user_id": user_id,
+            "window_start": start,
+            "window_end": end,
+            "twitter_min_confidence": rule.twitter_signal_min_confidence,
+        },
+    )
+    raw_rows = list(result.mappings())
 
     raw: list[dict[str, Any]] = []
     target_ids: set[str] = set()
-    for r in rows:
-        d = dict(r)
-        target = d.get("target")
-        watcher = d.get("w")
-        if target:
-            target_ids.add(dict(target).get("canonical_id"))
+    for r in raw_rows:
+        tid = str(r["target_id"])
+        wid = str(r["watcher_id"])
+        target_ids.add(tid)
         raw.append({
-            "target":         dict(target) if target else None,
-            "w":              dict(watcher) if watcher else None,
-            "edge_at":        d.get("edge_at"),
-            "signal_type":    d.get("signal_type"),
-            "repo_full_name": d.get("repo_full_name"),
-            "repo_url":       d.get("repo_url"),
-            "evidence_url":   d.get("evidence_url"),
-            "edge_confidence": d.get("edge_confidence"),
+            "target": {"canonical_id": tid, "display_name": r["target_name"]},
+            "w":      {"canonical_id": wid, "display_name": r["watcher_name"]},
+            "edge_at":         r["edge_at"],
+            "signal_type":     r["signal_type"],
+            "repo_full_name":  r["repo_full_name"],
+            "repo_url":        r["repo_url"],
+            "evidence_url":    r["evidence_url"],
+            "edge_confidence": r["edge_confidence"],
         })
 
-    # M12.5: batch-fetch each target's max owned-repo star count for the
-    # GitHub-prominence score component. Single Cypher round-trip.
     target_prominence_stars: dict[str, int] = {}
     if target_ids:
-        with driver.session() as session:
-            prom_rows = session.run(QUERY_TARGET_PROMINENCE,
-                                    ids=list(target_ids)).data()
-        target_prominence_stars = {r["id"]: int(r["max_stars"] or 0)
-                                    for r in prom_rows}
+        prom_result = await session.execute(
+            TARGET_PROMINENCE_SQL,
+            {"ids": list(target_ids)},
+        )
+        target_prominence_stars = {
+            str(row["id"]): int(row["max_stars"] or 0)
+            for row in prom_result.mappings()
+        }
 
-    return aggregate(raw, user_id=user_id, window_start=window_start,
-                     window_end=window_end, window_days=rule.window_days,
-                     rule=rule,
-                     target_prominence_stars=target_prominence_stars)
+    return aggregate(
+        raw,
+        user_id=user_id,
+        window_start=window_start,
+        window_end=window_end,
+        window_days=rule.window_days,
+        rule=rule,
+        target_prominence_stars=target_prominence_stars,
+    )
 
 
-def persist_events(driver, events: list[ConvergenceEvent], *, user_id: str, window_end_iso: str) -> None:
-    """Idempotently MERGE each event and prune stale ones for this window."""
-    import json as _json
-    with driver.session() as session:
-        current_ids = [e.target_id for e in events]
-        for e in events:
-            session.run(
-                UPSERT_CONVERGENCE_EVENT,
+async def persist_events(session: AsyncSession, events: list[ConvergenceEvent], *,
+                          user_id: str, org_id: str, window_end_iso: str) -> None:
+    """Idempotently UPSERT each event and prune stale ones for this window."""
+    from db.models import ConvergenceEventRow
+
+    current_ids: list[str] = []
+    for e in events:
+        current_ids.append(e.target_id)
+        stmt = (
+            pg_insert(ConvergenceEventRow)
+            .values(
                 id=e.event_id,
-                target_id=e.target_id,
-                user_id=user_id,
-                fired_at=e.fired_at,
-                window_start=e.window_start,
-                window_end=e.window_end,
+                org_id=org_id,
+                target_person_id=e.target_id,
+                fired_at=_parse_iso(e.fired_at),
+                window_start=_parse_iso(e.window_start),
+                window_end=_parse_iso(e.window_end),
                 distinct_member_count=e.distinct_member_count,
-                member_ids=e.member_ids,
+                member_person_ids=e.member_ids,
                 score=e.score,
-                score_breakdown_json=_json.dumps(e.score_breakdown, default=str),
-                first_signal_at=e.first_signal_at,
-                last_signal_at=e.last_signal_at,
-                signal_type_counts_json=_json.dumps(e.signal_type_counts, default=str),
-                evidence_json=_json.dumps(e.evidence, default=str),
-            ).consume()
-        session.run(
-            DELETE_STALE_CONVERGENCE_EVENTS,
-            user_id=user_id,
-            window_end_date=window_end_iso[:10],
-            current_target_ids=current_ids,
-        ).consume()
+                score_breakdown=e.score_breakdown,
+                first_signal_at=_parse_iso(e.first_signal_at) if e.first_signal_at else None,
+                last_signal_at=_parse_iso(e.last_signal_at) if e.last_signal_at else None,
+                signal_type_counts=e.signal_type_counts,
+                evidence=e.evidence,
+            )
+            .on_conflict_do_update(
+                index_elements=["id"],
+                set_={
+                    "fired_at": _parse_iso(e.fired_at),
+                    "distinct_member_count": e.distinct_member_count,
+                    "member_person_ids": e.member_ids,
+                    "score": e.score,
+                    "score_breakdown": e.score_breakdown,
+                    "evidence": e.evidence,
+                    "first_signal_at": _parse_iso(e.first_signal_at) if e.first_signal_at else None,
+                    "last_signal_at": _parse_iso(e.last_signal_at) if e.last_signal_at else None,
+                    "signal_type_counts": e.signal_type_counts,
+                },
+            )
+        )
+        await session.execute(stmt)
+
+    # Prune stale events for this window: targets that now sit on the watchlist
+    # OR current-window events whose target dropped out of the candidate set.
+    await session.execute(
+        text("""
+            DELETE FROM convergence_event ce
+            WHERE ce.org_id = :org_id
+              AND (
+                EXISTS (
+                  SELECT 1 FROM watchlist_member wx
+                  WHERE wx.person_id = ce.target_person_id
+                    AND wx.user_id   = :user_id
+                    AND wx.tier      IN ('active','vip')
+                )
+                OR (
+                  ce.id LIKE :prefix
+                  AND NOT (ce.target_person_id::text = ANY(:current_ids))
+                )
+              )
+        """),
+        {
+            "org_id": org_id,
+            "user_id": user_id,
+            "prefix": f"%{window_end_iso[:10]}",
+            "current_ids": current_ids,
+        },
+    )
+
+    await session.commit()
 
 
 # --- CLI --------------------------------------------------------------------
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--user", default="demo")
-    parser.add_argument("--window", type=int, default=None, help="override AlertRule.window_days")
-    parser.add_argument("--min-members", type=int, default=None, help="override AlertRule.min_distinct_watchers")
-    parser.add_argument("--as-of", type=str, default=None,
-                        help="ISO date for the window end (backtest mode)")
-    parser.add_argument("--persist", action="store_true",
-                        help="MERGE ConvergenceEvent nodes into Neo4j")
-    parser.add_argument("--limit-print", type=int, default=20)
-    parser.add_argument("--save-rule", action="store_true",
-                        help="Save the resolved rule (with overrides) back to data/alert_rules.json")
-    args = parser.parse_args()
-
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-
-    try:
-        from dotenv import load_dotenv
-        from neo4j import GraphDatabase
-    except ImportError as exc:
-        print(f"ERROR: missing dependency ({exc.name}). Run: pip install -r requirements.txt", file=sys.stderr)
-        return 2
-
+async def _run_cli(args: argparse.Namespace) -> int:
+    from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
+
+    from db.engine import dispose_engine, session_scope
     from intelligence.rule import get_rule, save_rule
 
     rule = get_rule(args.user)
-    # Apply CLI overrides
     if args.window is not None:
         rule.window_days = args.window
     if args.min_members is not None:
@@ -535,38 +567,60 @@ def main() -> int:
         save_rule(args.user, rule)
         print(f"Saved rule for user={args.user}")
 
-    driver = GraphDatabase.driver(
-        os.environ["NEO4J_URI"],
-        auth=(os.environ["NEO4J_USER"], os.environ["NEO4J_PASSWORD"]),
-    )
-
-    as_of_dt = None
+    as_of_dt: Optional[datetime] = None
     if args.as_of:
         as_of_dt = datetime.fromisoformat(args.as_of)
         if as_of_dt.tzinfo is None:
             as_of_dt = as_of_dt.replace(tzinfo=timezone.utc)
 
-    events = find_convergences(driver, user_id=args.user, as_of=as_of_dt, rule=rule)
+    async with session_scope() as session:
+        events = await find_convergences(
+            session,
+            user_id=args.user,
+            org_id=args.org,
+            as_of=as_of_dt,
+            rule=rule,
+        )
 
-    print(f"\nWindow: {(as_of_dt or datetime.now(timezone.utc)).isoformat()} - {rule.window_days}d back")
-    print(f"Min members: {rule.min_distinct_watchers}  Signal types: {rule.signal_types}  Sort: {rule.sort_by}")
-    print(f"Convergences fired: {len(events)}")
-    print()
-    print(f"{'#':<3} {'score':>7} {'N':>3} {'target':<30} watchers")
-    print("-" * 100)
-    for i, e in enumerate(events[:args.limit_print], start=1):
-        watcher_str = ", ".join(e.member_names[:5])
-        if len(e.member_names) > 5:
-            watcher_str += f", +{len(e.member_names)-5} more"
-        print(f"{i:<3} {e.score:>7.2f} {e.distinct_member_count:>3}  {e.target_name[:30]:<30} {watcher_str}")
+        print(f"\nWindow: {(as_of_dt or datetime.now(timezone.utc)).isoformat()} - {rule.window_days}d back")
+        print(f"Min members: {rule.min_distinct_watchers}  Signal types: {rule.signal_types}  Sort: {rule.sort_by}")
+        print(f"Convergences fired: {len(events)}")
+        print()
+        print(f"{'#':<3} {'score':>7} {'N':>3} {'target':<30} watchers")
+        print("-" * 100)
+        for i, e in enumerate(events[:args.limit_print], start=1):
+            watcher_str = ", ".join(e.member_names[:5])
+            if len(e.member_names) > 5:
+                watcher_str += f", +{len(e.member_names)-5} more"
+            print(f"{i:<3} {e.score:>7.2f} {e.distinct_member_count:>3}  {e.target_name[:30]:<30} {watcher_str}")
 
-    if args.persist:
-        end = (as_of_dt or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        persist_events(driver, events, user_id=args.user, window_end_iso=end.isoformat())
-        print(f"\nPersisted {len(events)} ConvergenceEvent nodes.")
+        if args.persist:
+            end = (as_of_dt or datetime.now(timezone.utc)).astimezone(timezone.utc)
+            await persist_events(session, events, user_id=args.user, org_id=args.org,
+                                  window_end_iso=end.isoformat())
+            print(f"\nPersisted {len(events)} ConvergenceEvent rows.")
 
-    driver.close()
+    await dispose_engine()
     return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--user", default="demo")
+    parser.add_argument("--org", default="demo")
+    parser.add_argument("--window", type=int, default=None, help="override AlertRule.window_days")
+    parser.add_argument("--min-members", type=int, default=None, help="override AlertRule.min_distinct_watchers")
+    parser.add_argument("--as-of", type=str, default=None,
+                        help="ISO date for the window end (backtest mode)")
+    parser.add_argument("--persist", action="store_true",
+                        help="UPSERT ConvergenceEvent rows into Postgres")
+    parser.add_argument("--limit-print", type=int, default=20)
+    parser.add_argument("--save-rule", action="store_true",
+                        help="Save the resolved rule (with overrides) back to alert_rule")
+    args = parser.parse_args()
+
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    return asyncio.run(_run_cli(args))
 
 
 if __name__ == "__main__":
