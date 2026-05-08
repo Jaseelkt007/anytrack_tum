@@ -1,7 +1,8 @@
 """AlertRule — the editable, per-user policy that drives convergence detection.
 
-Persisted as JSON in `data/alert_rules.json`, keyed by user_id. Each user can
-have their own rule. Missing users fall back to DEFAULT_RULE.
+Persistence (v0.2): Postgres `alert_rule` table when `DATABASE_URL_DIRECT` is
+set; falls back to `data/alert_rules.json` for offline dev. Multi-tenancy
+arrives in sub-project #7 — for now every rule is scoped to org_id='demo'.
 
 This is the only place where alert thresholds, signal-type filters, and
 score weights live. Change a value here, re-run convergence (`POST
@@ -16,12 +17,15 @@ field gets a sane default so old rule files still load.
 from __future__ import annotations
 
 import json
+import os
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 RULES_FILE = ROOT / "data" / "alert_rules.json"
+DEMO_ORG = "demo"
 
 # Signal types the detector currently knows about. Extend as new edge types ship.
 KNOWN_SIGNAL_TYPES = ("FOLLOWS_ON_GITHUB", "STARRED_REPO", "FOLLOWS_ON_TWITTER")
@@ -122,15 +126,99 @@ DEFAULT_RULE = AlertRule()
 
 # --- Persistence -----------------------------------------------------------
 
+def _db_url() -> str | None:
+    """Direct (psycopg) URL — used by sync rule helpers."""
+    raw = os.environ.get("DATABASE_URL_DIRECT")
+    if not raw:
+        return None
+    # SQLAlchemy-style "postgresql+psycopg://..." → plain "postgresql://..."
+    return raw.replace("postgresql+psycopg://", "postgresql://")
+
+
+def _db_load_rule(user_id: str, *, org_id: str = DEMO_ORG) -> AlertRule | None:
+    url = _db_url()
+    if not url:
+        return None
+    try:
+        import psycopg
+    except ImportError:
+        return None
+    try:
+        with psycopg.connect(url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT payload FROM alert_rule WHERE org_id = %s AND user_id = %s",
+                    (org_id, user_id),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                payload = row[0]
+                if isinstance(payload, str):
+                    payload = json.loads(payload)
+                return _from_dict(payload)
+    except Exception:
+        return None
+
+
+def _db_save_rule(user_id: str, rule: AlertRule, *, org_id: str = DEMO_ORG) -> bool:
+    url = _db_url()
+    if not url:
+        return False
+    try:
+        import psycopg
+    except ImportError:
+        return False
+    try:
+        with psycopg.connect(url) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO alert_rule (org_id, user_id, payload, updated_at)
+                    VALUES (%s, %s, %s::jsonb, %s)
+                    ON CONFLICT (org_id, user_id) DO UPDATE
+                    SET payload = EXCLUDED.payload, updated_at = EXCLUDED.updated_at
+                    """,
+                    (org_id, user_id, json.dumps(rule.to_dict()),
+                     datetime.now(timezone.utc)),
+                )
+                conn.commit()
+        return True
+    except Exception:
+        return False
+
+
 def load_rules() -> dict[str, AlertRule]:
-    """Load all per-user rules from RULES_FILE. Returns empty dict if file missing."""
+    """Load all per-user rules. DB-first; JSON file fallback."""
+    url = _db_url()
+    if url:
+        try:
+            import psycopg
+            with psycopg.connect(url) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT user_id, payload FROM alert_rule WHERE org_id = %s",
+                        (DEMO_ORG,),
+                    )
+                    out: dict[str, AlertRule] = {}
+                    for user_id, payload in cur.fetchall():
+                        if isinstance(payload, str):
+                            payload = json.loads(payload)
+                        try:
+                            out[user_id] = _from_dict(payload)
+                        except (TypeError, ValueError):
+                            continue
+                    return out
+        except Exception:
+            pass
+
     if not RULES_FILE.exists():
         return {}
     try:
         raw = json.loads(RULES_FILE.read_text())
     except (json.JSONDecodeError, OSError):
         return {}
-    out: dict[str, AlertRule] = {}
+    out = {}
     for user_id, payload in (raw or {}).items():
         try:
             out[user_id] = _from_dict(payload)
@@ -141,14 +229,26 @@ def load_rules() -> dict[str, AlertRule]:
 
 def get_rule(user_id: str) -> AlertRule:
     """Get the rule for a user, falling back to defaults."""
+    rule = _db_load_rule(user_id)
+    if rule is not None:
+        return rule
     return load_rules().get(user_id, DEFAULT_RULE)
 
 
 def save_rule(user_id: str, rule: AlertRule) -> None:
-    """Persist rule for `user_id`. Validates before writing."""
+    """Persist rule for `user_id`. Validates before writing.
+
+    Tries Postgres first; falls back to JSON when DATABASE_URL_DIRECT is unset
+    or the DB write fails (which lets local dev work without postgres).
+    """
     errs = rule.validate()
     if errs:
         raise ValueError(f"invalid rule: {'; '.join(errs)}")
+
+    if _db_save_rule(user_id, rule):
+        return
+
+    # JSON fallback
     rules = load_rules()
     rules[user_id] = rule
     RULES_FILE.parent.mkdir(parents=True, exist_ok=True)
