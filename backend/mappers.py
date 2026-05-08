@@ -154,55 +154,68 @@ def explain_score(breakdown: dict, *,
 
     Each item: { key, label, value, description }. The frontend can render
     this as a tooltip / expandable list without needing to know the formula.
+
+    Reads the v2 score_breakdown produced by intelligence.scoring.score_v2:
+      raw_sum_of_contribs, founder_prior_multiplier, distinct_member_count,
+      raw_signal_count, post_independence_count, max_owned_repo_stars.
+    Also tolerates the legacy v0.1 keys (distinct_members, recency,
+    target_prominence, member_quality) so old persisted rows still render.
     """
     items: list[dict[str, Any]] = []
-    if "distinct_members" in breakdown:
-        n = distinct_member_count
+    n = int(breakdown.get("distinct_member_count")
+            or breakdown.get("distinct_members")
+            or distinct_member_count or 0)
+    items.append({
+        "key": "distinct_members",
+        "label": "Distinct watchers",
+        "value": float(n),
+        "description": (
+            f"{n} watcher{'s' if n != 1 else ''} from your network "
+            f"engaged with this target within the time window"
+        ),
+    })
+
+    raw_sum = float(breakdown.get("raw_sum_of_contribs") or 0.0)
+    if raw_sum > 0:
         items.append({
-            "key": "distinct_members",
-            "label": "Distinct watchers",
-            "value": float(breakdown.get("distinct_members") or 0.0),
+            "key": "raw_sum",
+            "label": "Weighted contribution",
+            "value": raw_sum,
             "description": (
-                f"{n} watcher{'s' if n != 1 else ''} from your network "
-                f"engaged with this target within the time window"
+                "Sum of (watcher tier × time decay × surprise) across all signals"
             ),
         })
-    if "recency" in breakdown:
-        rec = float(breakdown.get("recency") or 0.0)
-        if rec >= 0.66:
-            phrase = "very recent — most of the engagement is near the end of the window"
-        elif rec >= 0.33:
-            phrase = "moderate — engagement is mid-window"
-        else:
-            phrase = "older — engagement is near the start of the window"
+
+    raw_n = int(float(breakdown.get("raw_signal_count") or 0))
+    post_n = int(float(breakdown.get("post_independence_count") or 0))
+    if raw_n > post_n > 0:
+        collapsed = raw_n - post_n
         items.append({
-            "key": "recency",
-            "label": "Recency",
-            "value": rec,
-            "description": phrase,
-        })
-    if "target_prominence" in breakdown and float(breakdown.get("target_prominence") or 0.0) > 0:
-        items.append({
-            "key": "target_prominence",
-            "label": _PROMINENCE_LABEL,
-            "value": float(breakdown.get("target_prominence") or 0.0),
+            "key": "independence",
+            "label": "Independence collapse",
+            "value": float(collapsed),
             "description": (
-                f"Target owns a repo with ~{target_prominence_stars:,} stars"
-                if target_prominence_stars else
+                f"{collapsed} signal{'s' if collapsed != 1 else ''} collapsed "
+                "into a single contribution (same-event burst dampened)"
+            ),
+        })
+
+    fp = float(breakdown.get("founder_prior_multiplier")
+               or breakdown.get("target_prominence") or 0.0)
+    stars = int(target_prominence_stars
+                or float(breakdown.get("max_owned_repo_stars") or 0))
+    if fp > 1.0 or stars > 0:
+        items.append({
+            "key": "founder_prior",
+            "label": _PROMINENCE_LABEL,
+            "value": fp if fp > 0 else 1.0,
+            "description": (
+                f"Target owns a repo with ~{stars:,} stars"
+                if stars else
                 "Target owns a high-star repository on GitHub"
             ),
         })
-    if "member_quality" in breakdown:
-        v = float(breakdown.get("member_quality") or 0.0)
-        items.append({
-            "key": "member_quality",
-            "label": "Watcher quality",
-            "value": v,
-            "description": (
-                "Bayesian per-watcher precision — currently a placeholder (0.0); "
-                "fills in once we have outcome labels (M11)"
-            ),
-        })
+
     return items
 
 
@@ -232,6 +245,24 @@ def map_alert(row: dict[str, Any], *, window_days: int = 90, rank: Optional[int]
     evidence = _safe_json(row.get("evidence_json"), default=[])
     breakdown = _safe_json(row.get("score_breakdown_json"), default={})
     type_counts = _safe_json(row.get("signal_type_counts_json"), default={})
+
+    # Frontend ConvergenceMeta.scoreBreakdown still types `distinct_members`,
+    # `recency`, `member_quality` for backwards compatibility. Project them
+    # from the v2 keys so existing Lovable UI panels keep rendering. We keep
+    # the v2 keys alongside so new UIs can read the rich shape.
+    distinct_members_compat = (
+        breakdown.get("distinct_member_count")
+        or breakdown.get("distinct_members")
+        or row.get("distinct_watchers") or 0
+    )
+    breakdown = {
+        **breakdown,
+        "distinct_members": float(distinct_members_compat),
+        # Recency is folded into per-contribution time decay in v2; expose 0
+        # rather than fabricating a single number that no longer exists.
+        "recency": float(breakdown.get("recency") or 0.0),
+        "member_quality": float(breakdown.get("member_quality") or 0.0),
+    }
 
     signals = []
     for ev in evidence:
