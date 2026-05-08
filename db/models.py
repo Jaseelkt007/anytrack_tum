@@ -296,7 +296,7 @@ class FeedbackEvent(Base):
 class ScraperAccount(Base):
     __tablename__ = "scraper_account"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
-    source: Mapped[str] = mapped_column(Text, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False, index=True)
     credentials: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     daily_quota: Mapped[int | None] = mapped_column(Integer)
     used_today: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
@@ -304,11 +304,73 @@ class ScraperAccount(Base):
     health: Mapped[str] = mapped_column(Text, nullable=False, server_default="healthy")
     ban_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     org_id: Mapped[str | None] = mapped_column(Text, ForeignKey("org.id"))
+    # Sub-project #4 additions
+    geo: Mapped[str | None] = mapped_column(Text)
+    sticky_watcher_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("person.id")
+    )
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notes: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     __table_args__ = (
         CheckConstraint("health IN ('healthy','cooldown','banned')", name="ck_sa_health"),
+    )
+
+
+class Proxy(Base):
+    """Outbound proxy endpoint. Used by stealth-needing sources (LinkedIn, Twitter)."""
+    __tablename__ = "proxy"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)  # residential|mobile|datacenter
+    provider: Mapped[str | None] = mapped_column(Text)        # iproyal | brightdata | self
+    geo: Mapped[str | None] = mapped_column(Text)
+    host: Mapped[str] = mapped_column(Text, nullable=False)
+    port: Mapped[int] = mapped_column(Integer, nullable=False)
+    username: Mapped[str | None] = mapped_column(Text)
+    password: Mapped[str | None] = mapped_column(Text)
+    health: Mapped[str] = mapped_column(Text, nullable=False, server_default="healthy")
+    ban_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    notes: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    __table_args__ = (
+        CheckConstraint(
+            "kind IN ('residential','mobile','datacenter')", name="ck_proxy_kind",
+        ),
+        CheckConstraint(
+            "health IN ('healthy','cooldown','banned')", name="ck_proxy_health",
+        ),
+    )
+
+
+class CrawlLease(Base):
+    """Audit row for one resource lease (account + proxy bundled)."""
+    __tablename__ = "crawl_lease"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    account_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("scraper_account.id")
+    )
+    proxy_id: Mapped[int | None] = mapped_column(BigInteger, ForeignKey("proxy.id"))
+    watcher_person_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("person.id")
+    )
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    leased_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    released_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    status: Mapped[str] = mapped_column(Text, nullable=False, server_default="held")
+    outcome: Mapped[str | None] = mapped_column(Text)
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('held','released','expired','failed')", name="ck_lease_status",
+        ),
+        Index("idx_crawl_lease_status_held", "status", "leased_at"),
     )
 
 
