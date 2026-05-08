@@ -23,8 +23,9 @@ pydantic==2.10.4
 # --- Phase 2 / M7 identity resolver (LLM arbitration via Gemini) ---
 google-generativeai==0.8.3
 
-# --- Phase 2 / M12 pipeline scheduler ---
-APScheduler==3.10.4
+# --- Job queue (Procrastinate, Postgres-backed; replaces APScheduler in v0.3) ---
+procrastinate[psycopg2]==3.0.0
+APScheduler==3.10.4  # legacy — only the disabled scheduler still imports this
 
 # --- Phase 2 / M12-email — Resend digest delivery ---
 resend==2.4.0
