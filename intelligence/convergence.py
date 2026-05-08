@@ -81,7 +81,11 @@ WITH window_signals AS (
         tp.display_name                  AS target_name,
         ee.watcher_person_id             AS watcher_id,
         wp.display_name                  AS watcher_name,
+        w.archetype                      AS watcher_archetype,
+        w.weight                         AS watcher_weight_override,
         ee.observed_at                   AS edge_at,
+        'github'                         AS source,
+        'follow'                         AS action_type,
         'FOLLOWS_ON_GITHUB'              AS signal_type,
         NULL::text                       AS repo_full_name,
         NULL::text                       AS repo_url,
@@ -115,7 +119,11 @@ WITH window_signals AS (
         tp.display_name                  AS target_name,
         ee.watcher_person_id             AS watcher_id,
         wp.display_name                  AS watcher_name,
+        w.archetype                      AS watcher_archetype,
+        w.weight                         AS watcher_weight_override,
         ee.observed_at                   AS edge_at,
+        'github'                         AS source,
+        'star'                           AS action_type,
         'STARRED_REPO'                   AS signal_type,
         r.full_name                      AS repo_full_name,
         r.html_url                       AS repo_url,
@@ -152,7 +160,11 @@ WITH window_signals AS (
         tp.display_name                  AS target_name,
         ee.watcher_person_id             AS watcher_id,
         wp.display_name                  AS watcher_name,
+        w.archetype                      AS watcher_archetype,
+        w.weight                         AS watcher_weight_override,
         ee.observed_at                   AS edge_at,
+        'twitter'                        AS source,
+        'follow'                         AS action_type,
         'FOLLOWS_ON_TWITTER'             AS signal_type,
         NULL::text                       AS repo_full_name,
         NULL::text                       AS repo_url,
@@ -179,6 +191,14 @@ WITH window_signals AS (
       )
 )
 SELECT * FROM window_signals
+""")
+
+
+WATCHER_OUTBOUND_COUNTS_SQL = text("""
+    SELECT watcher_id, source, distinct_outbound_targets
+    FROM watcher_follow_stats
+    WHERE org_id = :org_id
+      AND watcher_id = ANY(:watcher_ids)
 """)
 
 
@@ -286,15 +306,33 @@ def aggregate(rows: list[dict[str, Any]],
               window_days: int,
               rule,
               *,
-              target_prominence_stars: dict[str, int] | None = None) -> list[ConvergenceEvent]:
+              target_prominence_stars: dict[str, int] | None = None,
+              watcher_outbound_counts: dict[tuple[str, str], int] | None = None,
+              ) -> list[ConvergenceEvent]:
     """Group raw signal rows by target and produce ConvergenceEvent objects.
 
-    `rule` is an intelligence.rule.AlertRule (kept untyped here to avoid a
-    circular import). Filters by signal_types, applies min_distinct_watchers,
-    weights via compute_score, sorts by rule.sort_by, truncates by rule.limit.
-    """
-    allowed_signals = set(rule.signal_types)
+    Uses intelligence.scoring.score_v2 — see that module for the formula.
 
+    `rule` is an intelligence.rule.AlertRule (kept untyped here to avoid a
+    circular import). `watcher_outbound_counts` maps (watcher_id, source) →
+    distinct-outbound-target count (used for base-rate calibration).
+    """
+    from intelligence.scoring import (
+        Contribution,
+        ScoreInputs,
+        half_life_for,
+        score_v2,
+        surprise_factor,
+        time_decay,
+        watcher_weight,
+    )
+
+    allowed_signals = set(rule.signal_types)
+    counts = watcher_outbound_counts or {}
+    end_dt = _parse_iso(window_end)
+
+    # Build per-target buckets carrying full v2 inputs alongside the legacy
+    # display fields the API mappers still consume.
     by_target: dict[str, dict[str, Any]] = {}
     for r in rows:
         target = r.get("target")
@@ -315,6 +353,7 @@ def aggregate(rows: list[dict[str, Any]],
             "newest_iso": None,
             "oldest_iso": None,
             "signal_type_counts": {},
+            "contributions": [],
         })
 
         watcher = r.get("w") or {}
@@ -322,7 +361,19 @@ def aggregate(rows: list[dict[str, Any]],
         watcher_name = watcher.get("display_name") or watcher_id
         bucket["members"][watcher_id] = watcher_name
 
-        edge_iso = _iso_str(r.get("edge_at"))
+        edge_at = r.get("edge_at")
+        edge_dt: datetime | None
+        if isinstance(edge_at, datetime):
+            edge_dt = edge_at if edge_at.tzinfo else edge_at.replace(tzinfo=timezone.utc)
+        elif isinstance(edge_at, str):
+            try:
+                edge_dt = _parse_iso(edge_at)
+            except ValueError:
+                edge_dt = None
+        else:
+            edge_dt = None
+        edge_iso = _iso_str(edge_at)
+
         bucket["evidence"].append({
             "watcher_id":   watcher_id,
             "watcher_name": watcher_name,
@@ -343,31 +394,65 @@ def aggregate(rows: list[dict[str, Any]],
             if bucket["oldest_iso"] is None or edge_iso < bucket["oldest_iso"]:
                 bucket["oldest_iso"] = edge_iso
 
+        # --- v2 scoring inputs ---------------------------------------------
+        source = r.get("source") or ""
+        action_type = r.get("action_type") or ""
+        weight = watcher_weight(
+            archetype=r.get("watcher_archetype"),
+            archetype_weights=rule.archetype_weights,
+            override=r.get("watcher_weight_override"),
+        )
+        hl = half_life_for(
+            source, action_type,
+            half_lives=rule.source_half_lives_days,
+            default=rule.default_half_life_days,
+        )
+        decay = time_decay(observed_at=edge_dt, window_end=end_dt, half_life_days=hl)
+        outbound = counts.get((watcher_id, source), 0) if source else 0
+        surprise = surprise_factor(
+            watcher_outbound_count=outbound,
+            population_size=rule.population_size,
+            alpha=rule.watcher_base_rate_alpha,
+            beta=rule.watcher_base_rate_beta,
+        )
+        contrib = weight * decay * surprise
+        bucket["contributions"].append(Contribution(
+            watcher_id=watcher_id,
+            target_id=target_id,
+            source=source,
+            observed_at=edge_dt,
+            contrib=contrib,
+        ))
+
     fired_at = datetime.now(timezone.utc).isoformat()
     events: list[ConvergenceEvent] = []
     for tid, b in by_target.items():
         n = len(b["members"])
         if n < rule.min_distinct_watchers:
             continue
+
         member_ids = list(b["members"].keys())
         member_names = list(b["members"].values())
         prominence_stars = (target_prominence_stars or {}).get(tid, 0)
-        prominence_value = compute_target_prominence(
-            prominence_stars,
-            min_stars=rule.prominence_min_stars,
-            max_cap=rule.prominence_max_stars_cap,
+
+        sc = score_v2(
+            ScoreInputs(
+                target_id=tid,
+                contributions=b["contributions"],
+                max_owned_repo_stars=prominence_stars,
+            ),
+            rule=rule,
         )
-        score, breakdown = compute_score(
-            n, b["newest_iso"], window_end, window_days,
-            weight_distinct_members=rule.weight_distinct_members,
-            weight_recency=rule.weight_recency,
-            weight_member_quality=rule.weight_member_quality,
-            member_quality_value=0.0,
-            weight_target_prominence=rule.weight_target_prominence,
-            target_prominence_value=prominence_value,
-        )
-        if score < rule.min_score:
+
+        if sc.score < rule.min_score:
             continue
+
+        breakdown = {
+            **sc.breakdown,
+            "distinct_member_count": float(n),
+            "max_owned_repo_stars":  float(prominence_stars),
+        }
+
         events.append(ConvergenceEvent(
             target_id=tid,
             target_name=b["target_name"],
@@ -378,7 +463,7 @@ def aggregate(rows: list[dict[str, Any]],
             distinct_member_count=n,
             member_ids=member_ids,
             member_names=member_names,
-            score=score,
+            score=sc.score,
             score_breakdown=breakdown,
             first_signal_at=b["oldest_iso"],
             last_signal_at=b["newest_iso"],
@@ -435,14 +520,20 @@ async def find_convergences(session: AsyncSession,
 
     raw: list[dict[str, Any]] = []
     target_ids: set[str] = set()
+    watcher_ids: set[str] = set()
     for r in raw_rows:
         tid = str(r["target_id"])
         wid = str(r["watcher_id"])
         target_ids.add(tid)
+        watcher_ids.add(wid)
         raw.append({
             "target": {"canonical_id": tid, "display_name": r["target_name"]},
             "w":      {"canonical_id": wid, "display_name": r["watcher_name"]},
+            "watcher_archetype":        r.get("watcher_archetype"),
+            "watcher_weight_override":  r.get("watcher_weight_override"),
             "edge_at":         r["edge_at"],
+            "source":          r.get("source"),
+            "action_type":     r.get("action_type"),
             "signal_type":     r["signal_type"],
             "repo_full_name":  r["repo_full_name"],
             "repo_url":        r["repo_url"],
@@ -461,6 +552,18 @@ async def find_convergences(session: AsyncSession,
             for row in prom_result.mappings()
         }
 
+    # Per-(watcher, source) outbound count, used by surprise_factor.
+    watcher_outbound_counts: dict[tuple[str, str], int] = {}
+    if watcher_ids:
+        out_result = await session.execute(
+            WATCHER_OUTBOUND_COUNTS_SQL,
+            {"org_id": org_id, "watcher_ids": list(watcher_ids)},
+        )
+        for row in out_result.mappings():
+            watcher_outbound_counts[(str(row["watcher_id"]), row["source"])] = int(
+                row["distinct_outbound_targets"] or 0
+            )
+
     return aggregate(
         raw,
         user_id=user_id,
@@ -469,6 +572,7 @@ async def find_convergences(session: AsyncSession,
         window_days=rule.window_days,
         rule=rule,
         target_prominence_stars=target_prominence_stars,
+        watcher_outbound_counts=watcher_outbound_counts,
     )
 
 
