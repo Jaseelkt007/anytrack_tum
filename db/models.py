@@ -113,6 +113,9 @@ class WatchlistMember(Base):
     tier: Mapped[str] = mapped_column(Text, nullable=False)
     archetype: Mapped[str | None] = mapped_column(Text)
     rationale: Mapped[str | None] = mapped_column(Text)
+    # Per-watcher score weight override. NULL = derive from archetype using
+    # AlertRule.archetype_weights. Non-null overrides everything.
+    weight: Mapped[float | None] = mapped_column(Float)
     added_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
