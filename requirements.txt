@@ -2,9 +2,15 @@
 # Pinned to recent stable versions; bump as needed in later phases.
 
 # --- Core ---
-neo4j==5.28.1
 python-dotenv==1.0.1
 requests==2.32.3
+
+# --- Database (Postgres + pgvector via SQLAlchemy 2.0 async) ---
+sqlalchemy[asyncio]==2.0.36
+asyncpg==0.30.0
+psycopg[binary]==3.2.3
+alembic==1.14.0
+pgvector==0.3.6
 
 # --- M3 GitHub scraping ---
 PyGithub==2.5.0
@@ -25,4 +31,5 @@ resend==2.4.0
 
 # --- Dev / testing ---
 pytest==8.3.4
+pytest-asyncio==0.24.0
 ruff==0.8.4
