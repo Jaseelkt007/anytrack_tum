@@ -97,12 +97,20 @@ def surprise_factor(
 
 @dataclass
 class Contribution:
-    """One (watcher → target) contribution before clustering."""
+    """One (watcher → target) contribution before clustering.
+
+    `cluster_eligible` is True only when `observed_at` is a real-world event
+    timestamp (e.g. github_star.starred_at, twitter_retweet.created_at). For
+    GitHub `follow` signals, observed_at is the crawl time — clustering them
+    would conflate independent watchers into a single cascade and silently
+    suppress real signal. Set False in that case.
+    """
     watcher_id: str
     target_id: str
     source: str
     observed_at: datetime | None
     contrib: float
+    cluster_eligible: bool = False
 
 
 def collapse_clusters(
@@ -112,20 +120,28 @@ def collapse_clusters(
 ) -> list[Contribution]:
     """Collapse same-target+source signals observed within `window_minutes`
     of each other into one contribution (the max). This dampens viral cascades
-    where many watchers follow/star within the same hour.
+    where many watchers star/retweet within the same hour.
 
-    `window_minutes` <= 0 disables clustering.
+    Only contributions with `cluster_eligible=True` are considered for
+    collapsing — follows (which carry crawl-time, not event-time) pass through
+    unchanged so independent watchers are never merged.
+
+    `window_minutes` <= 0 disables clustering entirely.
     """
     items = list(contribs)
     if window_minutes <= 0 or not items:
         return items
 
-    # Group by (target, source). Within each group, sort by time and bucket.
+    eligible = [c for c in items if c.cluster_eligible]
+    passthrough = [c for c in items if not c.cluster_eligible]
+    if not eligible:
+        return passthrough + [c for c in items if c.cluster_eligible]
+
     by_key: dict[tuple[str, str], list[Contribution]] = {}
-    for c in items:
+    for c in eligible:
         by_key.setdefault((c.target_id, c.source), []).append(c)
 
-    out: list[Contribution] = []
+    out: list[Contribution] = list(passthrough)
     window_seconds = window_minutes * 60
     for group in by_key.values():
         group.sort(key=lambda c: (c.observed_at or datetime.min))

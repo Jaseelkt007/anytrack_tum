@@ -103,9 +103,9 @@ def test_surprise_high_volume_watcher_lower_than_selective():
 def test_collapse_clusters_collapses_within_window():
     base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     contribs = [
-        Contribution("w1", "t", "github", base, contrib=2.0),
-        Contribution("w2", "t", "github", base + timedelta(minutes=10), contrib=5.0),
-        Contribution("w3", "t", "github", base + timedelta(minutes=20), contrib=3.0),
+        Contribution("w1", "t", "github", base, contrib=2.0, cluster_eligible=True),
+        Contribution("w2", "t", "github", base + timedelta(minutes=10), contrib=5.0, cluster_eligible=True),
+        Contribution("w3", "t", "github", base + timedelta(minutes=20), contrib=3.0, cluster_eligible=True),
     ]
     out = collapse_clusters(contribs, window_minutes=60)
     # All three within the same hour → one bucket, max 5.0
@@ -113,11 +113,24 @@ def test_collapse_clusters_collapses_within_window():
     assert out[0].contrib == 5.0
 
 
+def test_collapse_clusters_does_not_collapse_ineligible_contributions():
+    """Follows carry crawl-time, not real timestamps. They must pass through."""
+    base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    contribs = [
+        Contribution("w1", "t", "github", base, contrib=2.0, cluster_eligible=False),
+        Contribution("w2", "t", "github", base, contrib=5.0, cluster_eligible=False),
+    ]
+    out = collapse_clusters(contribs, window_minutes=60)
+    # Both ineligible → both pass through
+    assert len(out) == 2
+    assert sorted(c.contrib for c in out) == [2.0, 5.0]
+
+
 def test_collapse_clusters_keeps_separate_clusters_apart():
     base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     contribs = [
-        Contribution("w1", "t", "github", base, contrib=2.0),
-        Contribution("w2", "t", "github", base + timedelta(hours=2), contrib=5.0),
+        Contribution("w1", "t", "github", base, contrib=2.0, cluster_eligible=True),
+        Contribution("w2", "t", "github", base + timedelta(hours=2), contrib=5.0, cluster_eligible=True),
     ]
     out = collapse_clusters(contribs, window_minutes=60)
     # Two clusters; both kept (max in each)
@@ -128,8 +141,8 @@ def test_collapse_clusters_keeps_separate_clusters_apart():
 def test_collapse_clusters_disabled_when_window_zero():
     base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     contribs = [
-        Contribution("w1", "t", "github", base, contrib=2.0),
-        Contribution("w2", "t", "github", base + timedelta(minutes=1), contrib=5.0),
+        Contribution("w1", "t", "github", base, contrib=2.0, cluster_eligible=True),
+        Contribution("w2", "t", "github", base + timedelta(minutes=1), contrib=5.0, cluster_eligible=True),
     ]
     out = collapse_clusters(contribs, window_minutes=0)
     assert len(out) == 2  # no collapse
@@ -138,9 +151,9 @@ def test_collapse_clusters_disabled_when_window_zero():
 def test_collapse_clusters_separates_by_target_and_source():
     base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     contribs = [
-        Contribution("w1", "tA", "github", base, contrib=2.0),
-        Contribution("w2", "tB", "github", base, contrib=3.0),
-        Contribution("w3", "tA", "twitter", base, contrib=4.0),
+        Contribution("w1", "tA", "github", base, contrib=2.0, cluster_eligible=True),
+        Contribution("w2", "tB", "github", base, contrib=3.0, cluster_eligible=True),
+        Contribution("w3", "tA", "twitter", base, contrib=4.0, cluster_eligible=True),
     ]
     out = collapse_clusters(contribs, window_minutes=60)
     # Three distinct (target,source) groups → no collapse across them
@@ -207,12 +220,27 @@ def test_score_v2_applies_founder_prior_multiplicatively():
 def test_score_v2_independence_collapses_burst():
     base = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
     contribs = [
-        Contribution("w1", "t", "github", base, contrib=2.0),
-        Contribution("w2", "t", "github", base + timedelta(minutes=5), contrib=3.0),
-        Contribution("w3", "t", "github", base + timedelta(minutes=10), contrib=4.0),
+        Contribution("w1", "t", "github", base, contrib=2.0, cluster_eligible=True),
+        Contribution("w2", "t", "github", base + timedelta(minutes=5), contrib=3.0, cluster_eligible=True),
+        Contribution("w3", "t", "github", base + timedelta(minutes=10), contrib=4.0, cluster_eligible=True),
     ]
     rule = _rule_with(independence_window_minutes=60)
     sc = score_v2(ScoreInputs(target_id="t", contributions=contribs), rule=rule)
     # All in same cluster → max contrib survives
     assert sc.raw == 4.0
     assert sc.cluster_count == 1
+
+
+def test_score_v2_follows_are_not_collapsed_even_with_same_observed_at():
+    """Crawl-time follows must remain independent — that is the entire point
+    of the cluster_eligible flag."""
+    crawl_time = datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc)
+    contribs = [
+        Contribution("w1", "t", "github", crawl_time, contrib=10.0, cluster_eligible=False),
+        Contribution("w2", "t", "github", crawl_time, contrib=10.0, cluster_eligible=False),
+    ]
+    rule = _rule_with(independence_window_minutes=60)
+    sc = score_v2(ScoreInputs(target_id="t", contributions=contribs), rule=rule)
+    # Both pass through — raw = 20, not 10
+    assert sc.raw == 20.0
+    assert sc.cluster_count == 2

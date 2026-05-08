@@ -416,12 +416,16 @@ def aggregate(rows: list[dict[str, Any]],
             beta=rule.watcher_base_rate_beta,
         )
         contrib = weight * decay * surprise
+        # Only stars + retweets carry real event timestamps; follows record
+        # crawl-time, so they must NOT be eligible for cluster collapse.
+        cluster_eligible = action_type in {"star", "retweet", "like"}
         bucket["contributions"].append(Contribution(
             watcher_id=watcher_id,
             target_id=target_id,
             source=source,
             observed_at=edge_dt,
             contrib=contrib,
+            cluster_eligible=cluster_eligible,
         ))
 
     fired_at = datetime.now(timezone.utc).isoformat()
