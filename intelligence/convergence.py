@@ -8,13 +8,27 @@ same target Person within a sliding time window. Three signal types contribute:
   3. FOLLOWS_ON_TWITTER : watcher --[follow @ twitter]--> target Person
                           (with confidence threshold; broader watcher pool)
 
-Phase 1 scoring (kept simple — Bayesian + Cox come in Phase 2):
-    score = distinct_member_count
-          + recency_bonus            (0..1, more recent edges weighted more)
-          + member_quality_placeholder  (constant 0 in Phase 1)
+Scoring v2 (sub-project #3) — see intelligence.scoring for the formula:
+
+    for each (watcher, signal):
+        weight   = watcher_weight(archetype, override)
+        decay    = 0.5 ** (age_days / source_half_life_days)
+        surprise = log1p((pop + alpha) / (watcher_outbound_count + beta))
+        contrib  = weight * decay * surprise
+
+    independence: stars/retweets (real timestamps) collapse to one contribution
+                  per (target, source) within `independence_window_minutes`.
+                  Follows (crawl-time only) pass through unchanged.
+
+    raw           = sum(post-independence contribs)
+    founder_prior = 1 + log10(max(1, max_owned_repo_stars / prominence_min))
+                    capped at 1 + log10(prominence_max_stars_cap)
+    score         = raw * founder_prior
+
+All knobs live on intelligence.rule.AlertRule.
 
 CLI:
-    python -m intelligence.convergence                  # default 90d, N=2
+    python -m intelligence.convergence                  # default 365d, N=2
     python -m intelligence.convergence --window 365 --min-members 2 --persist
     python -m intelligence.convergence --as-of 2023-11-01  # backtest mode
 """
