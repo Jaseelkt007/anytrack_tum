@@ -14,12 +14,13 @@ from typing import ClassVar
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scrapers.base import Source
-from scrapers.types import CrawlResult, WatcherInfo
+from scrapers.types import CrawlResult, LeasedResources, WatcherInfo
 
 
 @dataclass
 class TwitterSource(Source):
     name: ClassVar[str] = "twitter"
+    requires_resources: ClassVar[bool] = True  # needs account + proxy + browser
 
     async def crawl_watcher(
         self,
@@ -28,6 +29,7 @@ class TwitterSource(Source):
         watcher: WatcherInfo,
         org_id: str,
         max_pages: int | None = None,
+        resources: LeasedResources | None = None,
     ) -> CrawlResult:
         raise NotImplementedError(
             "TwitterSource is deferred to sub-project #5 (own-infra scraping). "

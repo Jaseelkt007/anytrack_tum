@@ -31,23 +31,110 @@ async def crawl_watcher_for_source(
 ) -> dict:
     """Crawl one watcher's signals on one platform.
 
+    For sources with `requires_resources=True` we lease an account + proxy
+    via infra.accounts/infra.proxies, audit the lease in `crawl_lease`, and
+    report outcomes back to the pools. For sources that don't need them
+    (GitHub today) we skip the lease dance entirely.
+
     Idempotent: re-running for the same watcher only advances last_seen_at on
     existing edge_event rows. Designed to be retryable.
     """
+    from sqlalchemy import text as sa_text
+
     from scrapers.registry import get_source
-    from scrapers.types import WatcherInfo
+    from scrapers.types import LeasedResources, WatcherInfo
 
     source = get_source(source_name)
+    watcher_uuid = uuid.UUID(watcher_canonical_id)
     watcher = WatcherInfo(
-        canonical_id=uuid.UUID(watcher_canonical_id),
+        canonical_id=watcher_uuid,
         display_name=watcher_display_name,
         handle=watcher_handle,
     )
 
-    async with session_scope() as session:
-        result = await source.crawl_watcher(
-            session, watcher=watcher, org_id=org_id, max_pages=max_pages,
+    if not getattr(source, "requires_resources", False):
+        async with session_scope() as session:
+            result = await source.crawl_watcher(
+                session, watcher=watcher, org_id=org_id, max_pages=max_pages,
+            )
+    else:
+        from infra.accounts import (
+            NoAccountAvailable,
+            checkout_account,
+            report_account_outcome,
         )
+        from infra.proxies import (
+            NoProxyAvailable,
+            pick_proxy,
+            report_proxy_outcome,
+        )
+
+        # Stage 1: lease resources in their own committed transaction so other
+        # workers see the bumped used_today / last_used_at right away.
+        async with session_scope() as lease_session:
+            try:
+                account = await checkout_account(
+                    lease_session, source=source_name, watcher_id=watcher_uuid,
+                )
+            except NoAccountAvailable as exc:
+                logger.warning("no account available for %s: %s", source_name, exc)
+                raise
+
+            try:
+                proxy = await pick_proxy(
+                    lease_session, watcher_id=watcher_uuid,
+                )
+            except NoProxyAvailable:
+                proxy = None  # some sources may run direct; let Source decide
+
+            lease_row = (await lease_session.execute(
+                sa_text("""
+                    INSERT INTO crawl_lease
+                      (account_id, proxy_id, watcher_person_id, source, status)
+                    VALUES (:a, :p, :w, :s, 'held')
+                    RETURNING id
+                """),
+                {"a": account.id,
+                 "p": proxy.id if proxy else None,
+                 "w": watcher_uuid,
+                 "s": source_name},
+            )).first()
+            lease_id = lease_row[0]
+
+        resources = LeasedResources(account=account, proxy=proxy, lease_id=lease_id)
+
+        # Stage 2: do the crawl. Resource outcomes are reported in their own
+        # session so they survive even if the crawl session rolls back.
+        crawl_outcome = "released"
+        ban = False
+        try:
+            async with session_scope() as session:
+                result = await source.crawl_watcher(
+                    session, watcher=watcher, org_id=org_id,
+                    max_pages=max_pages, resources=resources,
+                )
+        except Exception:
+            crawl_outcome = "failed"
+            raise
+        finally:
+            async with session_scope() as outcome_session:
+                await report_account_outcome(
+                    outcome_session, account.id,
+                    success=(crawl_outcome == "released"), ban=ban,
+                )
+                if proxy is not None:
+                    await report_proxy_outcome(
+                        outcome_session, proxy.id,
+                        success=(crawl_outcome == "released"), ban=ban,
+                    )
+                await outcome_session.execute(
+                    sa_text("""
+                        UPDATE crawl_lease
+                        SET status = :status, released_at = now(), outcome = :outcome
+                        WHERE id = :id
+                    """),
+                    {"id": lease_id, "status": crawl_outcome, "outcome": crawl_outcome},
+                )
 
     logger.info(
         "crawl_watcher_for_source done: source=%s watcher=%s follows=%d stars=%d errors=%d",

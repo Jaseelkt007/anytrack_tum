@@ -27,7 +27,7 @@ from scrapers.persistence import (
     upsert_person_by_github,
     upsert_repository,
 )
-from scrapers.types import CrawlResult, WatcherInfo
+from scrapers.types import CrawlResult, LeasedResources, WatcherInfo
 
 logger = logging.getLogger("scrapers.github_source")
 
@@ -64,6 +64,7 @@ class GitHubSource(Source):
     """Source impl for github.com (follows + stars)."""
 
     name: ClassVar[str] = "github"
+    requires_resources: ClassVar[bool] = False
 
     skip_stars: bool = False
     skip_follows: bool = False
@@ -87,6 +88,7 @@ class GitHubSource(Source):
         watcher: WatcherInfo,
         org_id: str,
         max_pages: int | None = None,
+        resources: LeasedResources | None = None,  # ignored — GitHub uses its own token pool
     ) -> CrawlResult:
         result = CrawlResult(
             watcher_canonical_id=watcher.canonical_id,

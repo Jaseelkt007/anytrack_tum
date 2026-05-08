@@ -4,11 +4,21 @@ Kept deliberately small: `WatcherInfo` describes one active watcher, `CrawlResul
 is what a Source returns after crawling that watcher. Per-platform raw events
 (stars, follows, retweets, ...) are persisted directly to edge_event by the Source
 implementation, so we don't need a typed event union here.
+
+`LeasedResources` (sub-project #4): the worker hands a Source whatever
+infrastructure it needs to run the crawl. Sources that don't need them (e.g.
+GitHubSource — it talks to api.github.com directly through token rotation)
+ignore the kwarg.
 """
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from infra.accounts import LeasedAccount
+    from infra.proxies import LeasedProxy
 
 
 @dataclass(frozen=True)
@@ -43,3 +53,16 @@ class CrawlResult:
 
     def total(self) -> int:
         return self.follows_observed + self.stars_observed + self.other_observed
+
+
+@dataclass
+class LeasedResources:
+    """Bundle of leased infrastructure handed to a Source by the worker.
+
+    Set fields are guaranteed alive for the duration of one crawl; the worker
+    releases them and reports outcomes after the Source returns. Sources may
+    ignore any field they don't need.
+    """
+    account: "LeasedAccount | None" = None
+    proxy: "LeasedProxy | None" = None
+    lease_id: int | None = None  # crawl_lease.id — for outcome correlation
