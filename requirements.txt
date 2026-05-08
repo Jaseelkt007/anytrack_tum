@@ -27,6 +27,11 @@ google-generativeai==0.8.3
 procrastinate[psycopg2]==3.0.0
 APScheduler==3.10.4  # legacy — only the disabled scheduler still imports this
 
+# --- Stealth scraping (sub-project #4 infra; LinkedIn lands in #5) ---
+# Playwright Python only — the browser binaries live in the Browserless docker
+# service, so we don't need `playwright install` in app containers.
+playwright==1.50.0
+
 # --- Phase 2 / M12-email — Resend digest delivery ---
 resend==2.4.0
 

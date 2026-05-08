@@ -44,6 +44,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://anytrace:anytrace@postgres:5432/anytrace
       DATABASE_URL_DIRECT: postgresql+psycopg://anytrace:anytrace@postgres:5432/anytrace
+      BROWSERLESS_WS_URL: ws://browserless:3000
       GITHUB_TOKEN: ${GITHUB_TOKEN:-}
       GITHUB_TOKEN_2: ${GITHUB_TOKEN_2:-}
       GITHUB_TOKEN_3: ${GITHUB_TOKEN_3:-}
@@ -52,6 +53,19 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+  # Browser pool — only needed by stealth-scraping sources (LinkedIn in #5).
+  # Local dev: docker compose --profile browser up postgres browserless
+  browserless:
+    profiles: ["browser"]
+    image: ghcr.io/browserless/chromium:latest
+    container_name: anytrace-browserless
+    restart: unless-stopped
+    environment:
+      CONCURRENT: "5"
+      TOKEN: ${BROWSERLESS_TOKEN:-}
+    ports:
+      - "3000:3000"
 
 volumes:
   postgres_data: {}
